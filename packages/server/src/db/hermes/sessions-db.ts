@@ -749,10 +749,51 @@ export async function findLatestExactSessionIdWithProfile(
   const db = new DatabaseSync(dbPath, { open: true, readOnly: true })
   const loweredQuery = trimmed.toLowerCase()
   const likePattern = buildLikePattern(loweredQuery)
+  const kanbanPrompt = `work kanban task ${trimmed}`.toLowerCase()
+  const taskJsonNeedle = `"task_id": "${trimmed}"`.toLowerCase()
 
   try {
     const sourceClause = source ? 'AND s.source = ?' : ''
     const sourceParams = source ? [source] : []
+    const exactPromptSql = `
+      WITH base AS (
+        SELECT
+          ${SESSION_SELECT},
+          s.parent_session_id AS parent_session_id
+        FROM sessions s
+        WHERE s.source != 'tool' AND s.id NOT LIKE 'compress_%'
+          ${sourceClause}
+      )
+      SELECT base.id
+      FROM base
+      JOIN messages m ON m.session_id = base.id
+      WHERE m.role = 'user'
+        AND LOWER(TRIM(m.content)) = ?
+      ORDER BY base.last_active DESC, m.timestamp DESC
+      LIMIT 1
+    `
+    const exactPromptMatch = db.prepare(exactPromptSql).get(...sourceParams, kanbanPrompt) as Record<string, unknown> | undefined
+    if (exactPromptMatch?.id) return String(exactPromptMatch.id)
+
+    const taskJsonSql = `
+      WITH base AS (
+        SELECT
+          ${SESSION_SELECT},
+          s.parent_session_id AS parent_session_id
+        FROM sessions s
+        WHERE s.source != 'tool' AND s.id NOT LIKE 'compress_%'
+          ${sourceClause}
+      )
+      SELECT base.id
+      FROM base
+      JOIN messages m ON m.session_id = base.id
+      WHERE LOWER(m.content) LIKE ? ESCAPE '\\'
+      ORDER BY base.last_active DESC, m.timestamp DESC
+      LIMIT 1
+    `
+    const taskJsonMatch = db.prepare(taskJsonSql).get(...sourceParams, buildLikePattern(taskJsonNeedle)) as Record<string, unknown> | undefined
+    if (taskJsonMatch?.id) return String(taskJsonMatch.id)
+
     const contentSql = `
       WITH base AS (
         SELECT

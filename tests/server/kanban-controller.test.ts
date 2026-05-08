@@ -93,6 +93,33 @@ describe('kanban controller', () => {
     expect(c.body.session).toMatchObject({ id: 'session-1', title: 'Session one' })
   })
 
+  it('prefers exact kanban-task session matches over later sessions that merely reference the task id', async () => {
+    mockGetTask.mockResolvedValue({
+      task: { id: 't_348bfaaf', status: 'done' },
+      runs: [{ profile: 'default' }],
+      comments: [],
+      events: [],
+    })
+    mockFindLatestExactSessionId.mockResolvedValue('session_20260508_110903_58e664')
+    mockGetExactSessionDetail.mockResolvedValue({
+      title: 'work kanban task t_348bfaaf',
+      source: 'codex',
+      model: 'gpt-5.5',
+      started_at: 1,
+      ended_at: 2,
+      messages: [{ id: 'm1', role: 'user', content: 'work kanban task t_348bfaaf', timestamp: 1 }],
+    })
+
+    const c = ctx({ params: { id: 't_348bfaaf' } })
+    await ctrl.get(c)
+
+    expect(c.body.session).toMatchObject({
+      id: 'session_20260508_110903_58e664',
+      title: 'work kanban task t_348bfaaf',
+    })
+    expect(c.body.session.messages[0].content).toBe('work kanban task t_348bfaaf')
+  })
+
   it('validates create/search/readArtifact requests', async () => {
     const createCtx = ctx({ request: { body: {} } })
     await ctrl.create(createCtx)
