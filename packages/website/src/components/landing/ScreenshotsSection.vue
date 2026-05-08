@@ -77,7 +77,7 @@ onUnmounted(() => {
 
         <div class="screenshot-dots">
           <button
-            v-for="(img, i) in images"
+            v-for="(_img, i) in images"
             :key="i"
             class="dot-btn"
             :class="{ active: activeIndex === i }"

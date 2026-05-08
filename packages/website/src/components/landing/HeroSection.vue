@@ -2,11 +2,9 @@
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { ref, onMounted, onUnmounted } from 'vue'
-import { useTheme } from '@/composables/useTheme'
 
 const { t } = useI18n()
 const router = useRouter()
-const { isDark } = useTheme()
 const copied = ref(false)
 const canvasRef = ref<HTMLCanvasElement>()
 
@@ -37,11 +35,14 @@ function initCanvas() {
   const canvas = canvasRef.value
   if (!canvas) return
 
+  const parent = canvas.parentElement
+  if (!parent) return
+
   const ctx = canvas.getContext('2d')!
   const dpr = window.devicePixelRatio || 1
 
   function resize() {
-    const rect = canvas.parentElement!.getBoundingClientRect()
+    const rect = parent.getBoundingClientRect()
     canvas.width = rect.width * dpr
     canvas.height = rect.height * dpr
     canvas.style.width = rect.width + 'px'

@@ -2,7 +2,6 @@
 import { ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { NIcon } from 'naive-ui'
 import { useTheme } from '@/composables/useTheme'
 
 const { t, locale } = useI18n()
