@@ -35,19 +35,18 @@ function initCanvas() {
   const canvas = canvasRef.value
   if (!canvas) return
 
-  const parent = canvas.parentElement
-  if (!parent) return
-
   const ctx = canvas.getContext('2d')!
   const dpr = window.devicePixelRatio || 1
 
   function resize() {
-    const rect = parent.getBoundingClientRect()
-    canvas.width = rect.width * dpr
-    canvas.height = rect.height * dpr
-    canvas.style.width = rect.width + 'px'
-    canvas.style.height = rect.height + 'px'
-    ctx.scale(dpr, dpr)
+    const el = canvasRef.value
+    if (!el || !el.parentElement) return
+    const rect = el.parentElement.getBoundingClientRect()
+    el.width = rect.width * dpr
+    el.height = rect.height * dpr
+    el.style.width = rect.width + 'px'
+    el.style.height = rect.height + 'px'
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   }
 
   resize()
