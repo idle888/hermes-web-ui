@@ -308,13 +308,16 @@ export async function listLogFiles(): Promise<LogFileInfo[]> {
       ...execOpts,
     })
     const files: LogFileInfo[] = []
-    const lines = stdout.trim().split('\n').filter(l => l.includes('.log'))
+    // Windows 可能使用 \r\n 换行符，统一处理
+    const normalized = stdout.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+    const lines = normalized.trim().split('\n').filter(l => l.includes('.log'))
     for (const line of lines) {
       const match = line.match(/^\s+(\S+)\s+([\d.]+\w+)\s+(.+)$/)
       if (match) {
         const rawName = match[1]
         const name = rawName.replace(/\.log$/, '')
-        if (['agent', 'errors', 'gateway'].includes(name)) {
+        // 支持更多日志类型：agent, errors, gateway, 以及其他可能的日志文件
+        if (['agent', 'errors', 'gateway', 'error'].includes(name)) {
           files.push({ name, size: match[2], modified: match[3].trim() })
         }
       }
