@@ -3,17 +3,13 @@ import { closeDb } from '../db'
 import { getGatewayManagerInstance } from './gateway-bootstrap'
 
 function shouldStopGatewaysOnShutdown(signal: string): boolean {
+  // 总是停止网关，无论是开发环境还是生产环境
+  // 这样可以避免 nodemon 重启时的孤儿进程问题
   const override = process.env.HERMES_WEB_UI_STOP_GATEWAYS_ON_SHUTDOWN?.trim()
-  if (override === '1' || override === 'true') return true
   if (override === '0' || override === 'false') return false
+  if (override === '1' || override === 'true') return true
 
-  const lifecycle = process.env.npm_lifecycle_event
-  const isDevServer = Boolean(process.env.TS_NODE_DEV)
-    || lifecycle === 'dev'
-    || lifecycle === 'dev:server'
-    || process.env.NODE_ENV === 'development'
-
-  return signal !== 'SIGUSR2' && !isDevServer
+  return signal !== 'SIGUSR2'
 }
 
 export function bindShutdown(server: any, groupChatServer?: any, chatRunServer?: any): void {

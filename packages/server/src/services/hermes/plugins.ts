@@ -238,7 +238,7 @@ function resolveHermesAgentRoot(): string {
     '/opt/hermes',
     join(homedir(), '.hermes', 'hermes-agent'),     // Unix/Linux/macOS
   ]
-
+ 
   // Windows specific path
   if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
     candidates.push(join(process.env.LOCALAPPDATA, 'hermes', 'hermes-agent'))
@@ -246,7 +246,7 @@ function resolveHermesAgentRoot(): string {
 
   return (candidates.filter(Boolean) as string[]).find(hasHermesPluginModule) || ''
 }
-}
+
 
 function pythonCandidates(agentRoot: string): string[] {
   const hermesBin = process.env.HERMES_BIN?.trim()

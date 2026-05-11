@@ -345,6 +345,7 @@ export class GatewayManager {
    */
   private async resolvePort(name: string): Promise<{ port: number; host: string }> {
     const { port: configuredPort, host } = this.readProfilePort(name)
+    const configuredUrl = buildHttpUrl(host, configuredPort)
 
     // 检查是否是当前 profile 自己的端口（内存中的记录）
     const existing = this.gateways.get(name)
@@ -357,10 +358,18 @@ export class GatewayManager {
 
     // 检查 PID 文件指向的当前 profile 是否仍健康运行
     const pid = this.readPidFile(name)
-    const configuredUrl = buildHttpUrl(host, configuredPort)
     if (pid && this.isProcessAlive(pid) && await this.checkHealth(configuredUrl, 1000)) {
       logger.info('Profile "%s" already running on configured port %d (PID: %d)', name, configuredPort, pid)
       this.gateways.set(name, { pid, port: configuredPort, host, url: configuredUrl, owned: false })
+      this.allocatedPorts.add(configuredPort)
+      return { port: configuredPort, host }
+    }
+
+    // 新增：即使没有 PID 文件，如果配置端口上有健康的网关运行，也认为是当前 profile 的网关
+    // 这解决了 nodemon 重启后内存清空但网关仍在运行的情况
+    if (await this.checkHealth(configuredUrl, 2000)) {
+      logger.info('Profile "%s" has healthy gateway on configured port %d (no PID file, assuming ownership)', name, configuredPort)
+      this.gateways.set(name, { pid: 0, port: configuredPort, host, url: configuredUrl, owned: false })
       this.allocatedPorts.add(configuredPort)
       return { port: configuredPort, host }
     }
@@ -465,9 +474,18 @@ export class GatewayManager {
     const { port, host } = this.readProfilePort(name)
     const url = buildHttpUrl(host, port)
 
+    // 首先检查 PID 文件：如果存在且进程存活且健康，则标记为运行
     if (pid && this.isProcessAlive(pid) && await this.checkHealth(url)) {
       this.gateways.set(name, { pid, port, host, url, owned: false })
       return { profile: name, port, host, url, running: true, pid }
+    }
+
+    // 新增：即使没有 PID 文件，如果配置端口上有健康的网关运行，也认为是运行状态
+    // 这解决了 nodemon 重启后内存清空但网关仍在运行的情况
+    if (await this.checkHealth(url, 2000)) {
+      logger.info('DetectStatus: Profile "%s" has healthy gateway on port %d (no PID file)', name, port)
+      this.gateways.set(name, { pid: 0, port, host, url, owned: false })
+      return { profile: name, port, host, url, running: true, pid: 0 }
     }
 
     // 未运行或端口不匹配
@@ -867,14 +885,13 @@ export class GatewayManager {
     }
 
     // Phase 2: 并行启动
-    const tasks = toStart.map(async ({ name, endpoint }) => {
+    // 串行启动网关，避免并发时的lock file竞争条件
+    for (const { name, endpoint } of toStart) {
       try {
         await this.startResolved(name, endpoint)
       } catch (err: any) {
         logger.error(err, '%s: failed to start', name)
       }
-    })
-
-    await Promise.allSettled(tasks)
+    }
   }
 }
