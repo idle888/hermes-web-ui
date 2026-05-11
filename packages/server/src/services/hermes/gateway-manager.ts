@@ -128,6 +128,11 @@ interface ManagedGateway {
   process?: ChildProcess
 }
 
+interface ResolvedGatewayEndpoint {
+  port: number
+  host: string
+}
+
 function formatHostForUrl(host: string): string {
   if (host.startsWith('[') && host.endsWith(']')) return host
   return host.includes(':') ? `[${host}]` : host
@@ -135,6 +140,10 @@ function formatHostForUrl(host: string): string {
 
 function buildHttpUrl(host: string, port: number): string {
   return `http://${formatHostForUrl(host)}:${port}`
+}
+
+function isLocalHost(host: string): boolean {
+  return ['127.0.0.1', 'localhost', '::1', '[::1]', '0.0.0.0'].includes(host)
 }
 
 // ============================
@@ -327,30 +336,31 @@ export class GatewayManager {
    * 为 profile 分配可用端口（启动前调用）
    *
    * 检测顺序：
-   *   1. 检查是否是当前 profile 自己的端口 → 直接使用
-   *   2. 已管理的网关 + 已分配的端口 → 内存级检查（快）
-   *   3. 系统 TCP bind 测试 → 检测外部进程占用
-   *   4. 冲突则从 base+1 递增找空闲端口，写入 config.yaml
+   *   1. 当前 profile 已经健康运行 → 直接使用运行端口
+   *   2. 未运行 → 从 8642 开始找空闲端口
+   *   3. 检查已管理 profile / 本轮已分配端口 / 系统 TCP 占用
+   *   4. 先写入 config.yaml，再启动 gateway
    */
   private async resolvePort(name: string): Promise<{ port: number; host: string }> {
-    let { port, host } = this.readProfilePort(name)
-    console.log(port,host)
-    // 首先检查配置文件中的端口是否有进程在运行（用户手动启动或其他）
-    const configuredUrl = buildHttpUrl(host, port)
-    if (await this.checkHealth(configuredUrl, 1000)) {
-      // 配置文件中的端口有存活进程，可能是用户手动启动的
-      logger.info('Profile "%s" already running on configured port %d (external/manual start)', name, port)
-      this.allocatedPorts.add(port)
-      return { port, host }
-    }
+    const { port: configuredPort, host } = this.readProfilePort(name)
 
     // 检查是否是当前 profile 自己的端口（内存中的记录）
     const existing = this.gateways.get(name)
-    if (existing && existing.host === host && this.isProcessAlive(existing.pid)) {
+    if (existing && existing.host === host && this.isProcessAlive(existing.pid) && await this.checkHealth(existing.url, 1000)) {
       // 如果内存中有记录且进程存活，直接使用内存中的端口
       logger.info('Profile "%s" already running on port %d (in-memory record)', name, existing.port)
       this.allocatedPorts.add(existing.port)
       return { port: existing.port, host }
+    }
+
+    // 检查 PID 文件指向的当前 profile 是否仍健康运行
+    const pid = this.readPidFile(name)
+    const configuredUrl = buildHttpUrl(host, configuredPort)
+    if (pid && this.isProcessAlive(pid) && await this.checkHealth(configuredUrl, 1000)) {
+      logger.info('Profile "%s" already running on configured port %d (PID: %d)', name, configuredPort, pid)
+      this.gateways.set(name, { pid, port: configuredPort, host, url: configuredUrl })
+      this.allocatedPorts.add(configuredPort)
+      return { port: configuredPort, host }
     }
 
     // 收集已占用端口：本次启动已分配的端口 + 其他 profile 的网关端口
@@ -363,38 +373,13 @@ export class GatewayManager {
       }
     }
 
-    if (usedPorts.has(port)) {
-      // 已管理端口冲突 → 找空闲端口
-      const newPort = await this.findFreePort(port, host, usedPorts)
-      logger.info('Port %d is in use for profile "%s", reassigning to %d', port, name, newPort)
-      this.writeProfilePort(name, newPort, host)
-      port = newPort
+    const port = await this.findFreePort(8642, host, usedPorts)
+    if (configuredPort !== port) {
+      logger.info('Assigning port for profile "%s": %d → %d', name, configuredPort, port)
     } else {
-      // 跳过TCP bind测试，避免TIME_WAIT状态导致误判
-      // Hermes gateway的--replace标志会自动处理真正的端口冲突
-      logger.debug('Port %d available for profile "%s" (trusting --replace to handle conflicts)', port, name)
-
-      // 只在配置不完整时写入（避免不必要的配置文件写入）
-      try {
-        const configPath = join(this.profileDir(name), 'config.yaml')
-        if (existsSync(configPath)) {
-          const content = readFileSync(configPath, 'utf-8')
-          const cfg = yaml.load(content) as any || {}
-          const currentPort = cfg?.platforms?.api_server?.extra?.port
-          const currentHost = cfg?.platforms?.api_server?.extra?.host
-          if (currentPort === port && currentHost === host) {
-            logger.debug('Port %d already configured for profile "%s"', port, name)
-          } else {
-            logger.info('Updating port configuration for profile "%s": %d → %d', name, currentPort, port)
-            this.writeProfilePort(name, port, host)
-          }
-        } else {
-          this.writeProfilePort(name, port, host)
-        }
-      } catch {
-        this.writeProfilePort(name, port, host)
-      }
+      logger.debug('Assigning port %d for profile "%s"', port, name)
     }
+    this.writeProfilePort(name, port, host)
 
     this.allocatedPorts.add(port)
     return { port, host }
@@ -511,8 +496,13 @@ export class GatewayManager {
       return { profile: name, port: existing.port, host: existing.host, url: existing.url, running: true, pid: existing.pid }
     }
 
-    const { port, host } = await this.resolvePort(name)
-    console.log(port,host)
+    const endpoint = await this.resolvePort(name)
+    return this.startResolved(name, endpoint)
+  }
+
+  /** 使用已经解析好的端口启动网关，避免 startAll() 中重复分配端口 */
+  private async startResolved(name: string, endpoint: ResolvedGatewayEndpoint): Promise<GatewayStatus> {
+    const { port, host } = endpoint
     const hermesHome = this.profileDir(name)
     const url = buildHttpUrl(host, port)
 
@@ -573,12 +563,84 @@ export class GatewayManager {
       if (await this.checkHealth(url, 2000)) {
         // "gateway start" 自行管理进程，重新从 pid 文件读取实际 PID
         const actualPid = this.readPidFile(name) ?? pid
-        this.gateways.set(name, { pid: actualPid, port, host, url })
+        const processRef = this.gateways.get(name)?.process
+        this.gateways.set(name, { pid: actualPid, port, host, url, process: processRef })
         return { profile: name, port, host, url, running: true, pid: actualPid || undefined }
       }
       await new Promise(r => setTimeout(r, 500))
     }
     throw new Error(`Gateway health check timed out after 15000ms`)
+  }
+
+  private async getListeningPids(port: number): Promise<number[]> {
+    try {
+      if (process.platform === 'win32') {
+        const { stdout } = await execFileAsync('netstat', ['-ano', '-p', 'tcp'], {
+          timeout: 5000,
+          windowsHide: true,
+        })
+        const pids = new Set<number>()
+        for (const line of stdout.split(/\r?\n/)) {
+          const parts = line.trim().split(/\s+/)
+          if (parts.length < 5 || parts[0].toUpperCase() !== 'TCP') continue
+          const localAddress = parts[1]
+          const state = parts[3]?.toUpperCase()
+          const pid = parseInt(parts[4], 10)
+          if (state === 'LISTENING' && localAddress.endsWith(`:${port}`) && Number.isFinite(pid)) {
+            pids.add(pid)
+          }
+        }
+        return Array.from(pids)
+      }
+
+      const { stdout } = await execFileAsync('lsof', [`-tiTCP:${port}`, '-sTCP:LISTEN'], {
+        timeout: 5000,
+      })
+      return stdout
+        .split(/\r?\n/)
+        .map(line => parseInt(line.trim(), 10))
+        .filter(pid => Number.isFinite(pid))
+    } catch {
+      return []
+    }
+  }
+
+  private async killPid(pid: number, force = false): Promise<void> {
+    if (!pid) return
+
+    if (process.platform === 'win32') {
+      try {
+        await execFileAsync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+          timeout: 5000,
+          windowsHide: true,
+        })
+      } catch {
+        try { process.kill(pid) } catch { }
+      }
+      return
+    }
+
+    const signal = force ? 'SIGKILL' : 'SIGTERM'
+    try {
+      process.kill(-pid, signal)
+    } catch {
+      try { process.kill(pid, signal) } catch { }
+    }
+  }
+
+  private async stopViaHermesCli(name: string): Promise<void> {
+    const hermesHome = this.profileDir(name)
+    try {
+      const { stdout, stderr } = await execFileAsync(HERMES_BIN, ['gateway', 'stop'], {
+        timeout: 15000,
+        windowsHide: true,
+        env: { ...process.env, HERMES_HOME: hermesHome },
+      })
+      const output = `${stdout}${stderr}`.trim()
+      if (output) logger.debug('%s: hermes gateway stop: %s', name, output)
+    } catch (err) {
+      logger.debug('Failed to stop gateway via Hermes CLI for profile "%s": %s', name, err)
+    }
   }
 
   /**
@@ -589,25 +651,58 @@ export class GatewayManager {
   async stop(name: string, timeoutMs = 10000): Promise<void> {
     // 记录当前 URL，用于确认停止
     const gw = this.gateways.get(name)
-    const url = gw?.url || (() => {
-      const { port, host } = this.readProfilePort(name)
-      return buildHttpUrl(host, port)
-    })()
+    const configured = this.readProfilePort(name)
+    const port = gw?.port ?? configured.port
+    const host = gw?.host ?? configured.host
+    const url = gw?.url || buildHttpUrl(host, port)
 
     // 所有平台使用 run 模式，直接杀进程
-    let pid = gw?.pid
-    if (!pid) {
-      pid = this.readPidFile(name) ?? undefined
-    }
-    if (pid) {
-      // Windows 不支持进程组（负 PID）和 SIGTERM 信号
-      if (process.platform === 'win32') {
-        try { process.kill(pid) } catch { }
-      } else {
-        try { process.kill(-pid, 'SIGTERM') } catch {
-          try { process.kill(pid, 'SIGTERM') } catch { }
-        }
+    const pids = new Set<number>()
+    if (gw?.process?.pid) pids.add(gw.process.pid)
+    if (gw?.pid) pids.add(gw.pid)
+    const pidFilePid = this.readPidFile(name)
+    if (pidFilePid) pids.add(pidFilePid)
+    if (isLocalHost(host)) {
+      for (const pid of await this.getListeningPids(port)) {
+        pids.add(pid)
       }
+    }
+
+    if (pids.size === 0) {
+      if (!(await this.checkHealth(url, 1000))) {
+        this.gateways.delete(name)
+        this.allocatedPorts.delete(port)
+        this.clearPidFile(name)
+        logger.info('Stopped gateway for profile "%s" (already stopped)', name)
+        return
+      }
+      await this.stopViaHermesCli(name)
+      if (!(await this.checkHealth(url, 1000))) {
+        this.gateways.delete(name)
+        this.allocatedPorts.delete(port)
+        this.clearPidFile(name)
+        logger.info('Stopped gateway for profile "%s"', name)
+        return
+      }
+      throw new Error(`Cannot stop gateway for profile "${name}": no PID available`)
+    }
+
+    await this.stopViaHermesCli(name)
+
+    if (!(await this.checkHealth(url, 1000))) {
+      this.gateways.delete(name)
+      this.allocatedPorts.delete(port)
+      this.clearPidFile(name)
+      logger.info('Stopped gateway for profile "%s"', name)
+      return
+    }
+
+    if (gw?.process && !gw.process.killed) {
+      try { gw.process.kill(process.platform === 'win32' ? undefined : 'SIGTERM') } catch { }
+    }
+
+    for (const pid of pids) {
+      await this.killPid(pid)
     }
 
     // 等待 health check 失败，确认网关已真正停止
@@ -615,14 +710,43 @@ export class GatewayManager {
     while (Date.now() < deadline) {
       if (!(await this.checkHealth(url, 1000))) {
         this.gateways.delete(name)
+        this.allocatedPorts.delete(port)
+        this.clearPidFile(name)
         logger.info('Stopped gateway for profile "%s"', name)
         return
       }
       await new Promise(r => setTimeout(r, 300))
     }
-    // 超时也清理
-    this.gateways.delete(name)
-    logger.warn('Stopped gateway for profile "%s" (timeout)', name)
+
+    if (isLocalHost(host)) {
+      const listeningPids = await this.getListeningPids(port)
+      if (listeningPids.length) {
+        logger.warn(
+          'Gateway for profile "%s" still listening on port %d, force killing PIDs: %s',
+          name,
+          port,
+          listeningPids.join(', '),
+        )
+        for (const pid of listeningPids) {
+          await this.killPid(pid, true)
+        }
+
+        const forceDeadline = Date.now() + 3000
+        while (Date.now() < forceDeadline) {
+          if (!(await this.checkHealth(url, 500))) {
+            this.gateways.delete(name)
+            this.allocatedPorts.delete(port)
+            this.clearPidFile(name)
+            logger.info('Stopped gateway for profile "%s" (force killed)', name)
+            return
+          }
+          await new Promise(r => setTimeout(r, 200))
+        }
+      }
+    }
+
+    logger.warn('Failed to stop gateway for profile "%s" within %dms', name, timeoutMs)
+    throw new Error(`Gateway stop timed out after ${timeoutMs}ms`)
   }
 
   /** 停止所有已管理的网关（并行执行） */
@@ -663,7 +787,7 @@ export class GatewayManager {
 
     const profiles = await this.listProfiles()
     // Phase 1: 顺序处理
-    const toStart: string[] = []
+    const toStart: Array<{ name: string; endpoint: ResolvedGatewayEndpoint }> = []
     for (const name of profiles) {
       const existing = this.gateways.get(name)
       if (existing && this.isProcessAlive(existing.pid)) {
@@ -707,14 +831,14 @@ export class GatewayManager {
       }
 
       // 只为真正需要启动的网关分配端口
-      await this.resolvePort(name)
-      toStart.push(name)
+      const endpoint = await this.resolvePort(name)
+      toStart.push({ name, endpoint })
     }
 
     // Phase 2: 并行启动
-    const tasks = toStart.map(async (name) => {
+    const tasks = toStart.map(async ({ name, endpoint }) => {
       try {
-        await this.start(name)
+        await this.startResolved(name, endpoint)
       } catch (err: any) {
         logger.error(err, '%s: failed to start', name)
       }
