@@ -1,5 +1,5 @@
 import { execFile } from 'child_process'
-import { existsSync } from 'fs'
+import { existsSync, readFileSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 import { homedir } from 'os'
 import { promisify } from 'util'
@@ -231,6 +231,24 @@ function maybeRootFromHermesBin(): string[] {
   return candidates.filter((candidate, index) => candidates.indexOf(candidate) === index)
 }
 
+/**
+ * Parse the shebang of the hermes binary to extract the Python interpreter path.
+ * Works with pip-installed launchers, uv tool launchers, and manual venv installs.
+ * e.g. "#!/Users/ekko/.hermes/hermes-agent/venv/bin/python3" -> that path
+ */
+function pythonFromHermesShebang(): string | undefined {
+  const hermesBin = process.env.HERMES_BIN?.trim() || 'hermes'
+  try {
+    const resolved = resolve(hermesBin)
+    if (!existsSync(resolved)) return undefined
+    const head = readFileSync(resolved, 'utf8').slice(0, 256)
+    const match = head.match(/^#!\s*(\/[^\s\n]+)/)
+    return match ? match[1] : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function resolveHermesAgentRoot(): string {
   const candidates = [
     process.env.HERMES_AGENT_ROOT?.trim(),
@@ -262,10 +280,10 @@ function pythonCandidates(agentRoot: string): string[] {
   }
 
   const rootPythons = agentRoot ? [
-    join(agentRoot, 'venv', 'Scripts', 'python.exe'),  // Windows
     join(agentRoot, 'venv', 'bin', 'python'),          // Unix
-    join(agentRoot, '.venv', 'Scripts', 'python.exe'), // Windows (alternative)
+    join(agentRoot, 'venv', 'Scripts', 'python.exe'),  // Windows
     join(agentRoot, '.venv', 'bin', 'python'),         // Unix (alternative)
+    join(agentRoot, '.venv', 'Scripts', 'python.exe'), // Windows (alternative)
   ] : []
 
   const candidates = [
@@ -274,6 +292,7 @@ function pythonCandidates(agentRoot: string): string[] {
     ...rootPythons,
     'python3',
     'python',
+    pythonFromHermesShebang(),
   ].filter(Boolean) as string[]
 
   return candidates.filter((candidate) => {
