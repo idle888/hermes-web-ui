@@ -188,7 +188,7 @@ Single-container deployment with integrated Hermes Agent:
 
 ```bash
 # Use pre-built image (Recommended)
-WEBUI_IMAGE=ekkoye8888/hermes-web-ui:latest docker compose up -d
+WEBUI_IMAGE=ekkoye8888/hermes-web-ui docker compose up -d
 
 # Or build from source
 docker compose up -d --build

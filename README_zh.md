@@ -196,7 +196,7 @@ hermes-web-ui start
 
 ```bash
 # 使用预构建镜像（推荐）
-WEBUI_IMAGE=ekkoye8888/hermes-web-ui:latest docker compose up -d
+WEBUI_IMAGE=ekkoye8888/hermes-web-ui docker compose up -d
 
 # 或从源码构建
 docker compose up -d --build
