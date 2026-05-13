@@ -17,7 +17,6 @@ import { getSourceLabel } from "@/shared/session-display";
 import { copyToClipboard } from "@/utils/clipboard";
 import FolderPicker from "./FolderPicker.vue";
 import ChatInput from "./ChatInput.vue";
-import CliChatPanel from "./CliChatPanel.vue";
 import ConversationMonitorPane from "./ConversationMonitorPane.vue";
 import MessageList from "./MessageList.vue";
 import SessionListItem from "./SessionListItem.vue";
@@ -125,10 +124,15 @@ const groupedSessions = computed<SessionGroup[]>(() => {
 
   return keys.map((key) => ({
     source: key,
-    label: key ? getSourceLabel(key) : t("chat.other"),
+    label: key ? getChatSourceLabel(key) : t("chat.other"),
     sessions: sortSessionsWithActiveFirst(map.get(key)!),
   }));
 });
+
+function getChatSourceLabel(source?: string): string {
+  if (source === "cli") return "Bridge (beta)";
+  return getSourceLabel(source);
+}
 
 function toggleGroup(source: string) {
   const isExpanded = !collapsedGroups.value.has(source);
@@ -205,12 +209,38 @@ const activeSessionSource = computed(() =>
   currentMode.value === "chat" ? chatStore.activeSession?.source || "" : "",
 );
 
+const activeApproval = computed(() => chatStore.activePendingApproval);
+
 function handleNewChat() {
   chatStore.newChat();
 }
 
 function handleNewCliChat() {
-  chatStore.newCliChat();
+  const session = chatStore.newCliSession()
+  chatStore.switchSession(session.id)
+}
+
+const newChatOptions = computed(() => [
+  {
+    label: "API",
+    key: "api_server",
+  },
+  {
+    label: "Bridge (beta)",
+    key: "cli",
+  },
+]);
+
+function handleNewChatSelect(key: string | number) {
+  if (key === "cli") {
+    handleNewCliChat();
+    return;
+  }
+  handleNewChat();
+}
+
+function handleApproval(choice: "once" | "session" | "always" | "deny") {
+  chatStore.respondApproval(choice);
 }
 
 async function copySessionId(id?: string) {
@@ -561,42 +591,27 @@ async function handleWorkspaceConfirm() {
               </svg>
             </template>
           </NButton>
-          <NButton quaternary size="tiny" @click="handleNewChat" circle>
-            <template #icon>
-              <svg
-                width="14"
-                height="14"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-              >
-                <line x1="12" y1="5" x2="12" y2="19" />
-                <line x1="5" y1="12" x2="19" y2="12" />
-              </svg>
-            </template>
-          </NButton>
-          <NButton
-            quaternary
-            size="tiny"
-            @click="handleNewCliChat"
-            :title="t('chat.newCliChat')"
-            circle
+          <NDropdown
+            trigger="click"
+            :options="newChatOptions"
+            @select="handleNewChatSelect"
           >
-            <template #icon>
-              <svg
-                width="14"
-                height="14"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-              >
-                <polyline points="4 17 10 11 4 5" />
-                <line x1="12" y1="19" x2="20" y2="19" />
-              </svg>
-            </template>
-          </NButton>
+            <NButton quaternary size="tiny" circle>
+              <template #icon>
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <line x1="12" y1="5" x2="12" y2="19" />
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+              </template>
+            </NButton>
+          </NDropdown>
         </div>
       </div>
       <div v-if="showSessions" class="session-scope-note">
@@ -749,7 +764,7 @@ async function handleWorkspaceConfirm() {
           </NButton>
           <span class="header-session-title">{{ headerTitle }}</span>
           <span v-if="activeSessionSource" class="source-badge">{{
-            getSourceLabel(activeSessionSource)
+            getChatSourceLabel(activeSessionSource)
           }}</span>
           <span
             v-if="chatStore.activeSession?.workspace"
@@ -792,48 +807,75 @@ async function handleWorkspaceConfirm() {
               </template>
               {{ t("chat.copySessionId") }}
             </NTooltip>
-            <NButton size="small" :circle="isMobile" @click="handleNewChat">
-              <template #icon>
-                <svg
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                >
-                  <line x1="12" y1="5" x2="12" y2="19" />
-                  <line x1="5" y1="12" x2="19" y2="12" />
-                </svg>
-              </template>
-              <template v-if="!isMobile">{{ t("chat.newChat") }}</template>
-            </NButton>
-            <NButton size="small" :circle="isMobile" @click="handleNewCliChat">
-              <template #icon>
-                <svg
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                >
-                  <polyline points="4 17 10 11 4 5" />
-                  <line x1="12" y1="19" x2="20" y2="19" />
-                </svg>
-              </template>
-              <template v-if="!isMobile">{{ t("chat.newCliChat") }}</template>
-            </NButton>
+            <NDropdown
+              trigger="click"
+              :options="newChatOptions"
+              @select="handleNewChatSelect"
+            >
+              <NButton size="small" :circle="isMobile">
+                <template #icon>
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  >
+                    <line x1="12" y1="5" x2="12" y2="19" />
+                    <line x1="5" y1="12" x2="19" y2="12" />
+                  </svg>
+                </template>
+                <template v-if="!isMobile">{{ t("chat.newChat") }}</template>
+              </NButton>
+            </NDropdown>
           </template>
         </div>
       </header>
 
       <template v-if="currentMode === 'chat'">
-        <CliChatPanel v-if="chatStore.activeSession?.source === 'cli'" />
-        <template v-else>
-          <MessageList />
-          <ChatInput />
-        </template>
+        <MessageList />
+        <div v-if="activeApproval" class="approval-bar">
+          <div class="approval-main">
+            <div class="approval-title">Tool approval required</div>
+            <div class="approval-desc">{{ activeApproval.description }}</div>
+            <code class="approval-command">{{ activeApproval.command }}</code>
+          </div>
+          <div class="approval-actions">
+            <NButton
+              v-if="activeApproval.choices.includes('once')"
+              size="small"
+              type="primary"
+              @click="handleApproval('once')"
+            >
+              Allow once
+            </NButton>
+            <NButton
+              v-if="activeApproval.choices.includes('session')"
+              size="small"
+              @click="handleApproval('session')"
+            >
+              Allow session
+            </NButton>
+            <NButton
+              v-if="activeApproval.choices.includes('always')"
+              size="small"
+              @click="handleApproval('always')"
+            >
+              Always
+            </NButton>
+            <NButton
+              v-if="activeApproval.choices.includes('deny')"
+              size="small"
+              type="error"
+              ghost
+              @click="handleApproval('deny')"
+            >
+              Deny
+            </NButton>
+          </div>
+        </div>
+        <ChatInput />
       </template>
       <ConversationMonitorPane
         v-else
@@ -1302,6 +1344,54 @@ async function handleWorkspaceConfirm() {
   &:hover {
     transform: scale(1.1);
   }
+}
+
+.approval-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-top: 1px solid $border-color;
+  background: $bg-card;
+}
+
+.approval-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.approval-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: $text-primary;
+}
+
+.approval-desc {
+  margin-top: 2px;
+  font-size: 12px;
+  color: $text-secondary;
+}
+
+.approval-command {
+  display: block;
+  margin-top: 6px;
+  max-height: 56px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  color: $text-primary;
+  background: $bg-secondary;
+  border: 1px solid $border-color;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.approval-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 @keyframes rainbow-glow {

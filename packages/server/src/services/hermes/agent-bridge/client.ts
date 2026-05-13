@@ -2,7 +2,9 @@ import { setTimeout as delay } from 'timers/promises'
 import { createConnection, type Socket } from 'net'
 import { URL } from 'url'
 
-export const DEFAULT_AGENT_BRIDGE_ENDPOINT = 'ipc:///tmp/hermes-agent-bridge.sock'
+export const DEFAULT_AGENT_BRIDGE_ENDPOINT = process.platform === 'win32'
+  ? 'tcp://127.0.0.1:18765'
+  : 'ipc:///tmp/hermes-agent-bridge.sock'
 
 export type AgentBridgeStatus = 'running' | 'complete' | 'interrupted' | 'error'
 
@@ -40,6 +42,8 @@ export interface AgentBridgeOutput extends AgentBridgeResponse {
   done: boolean
   result?: unknown
   error?: string | null
+  events: Array<Record<string, unknown>>
+  event_cursor: number
 }
 
 export interface AgentBridgeRunResult extends AgentBridgeResponse {
@@ -200,11 +204,20 @@ export class AgentBridgeClient {
     return this.request({ action: 'ping' })
   }
 
-  chat(sessionId: string, message: AgentBridgeMessage): Promise<AgentBridgeChatStarted> {
+  chat(
+    sessionId: string,
+    message: AgentBridgeMessage,
+    conversationHistory?: unknown[],
+    instructions?: string,
+    profile?: string,
+  ): Promise<AgentBridgeChatStarted> {
     return this.request<AgentBridgeChatStarted>({
       action: 'chat',
       session_id: sessionId,
       message,
+      ...(conversationHistory ? { conversation_history: conversationHistory } : {}),
+      ...(instructions ? { instructions } : {}),
+      ...(profile ? { profile } : {}),
     })
   }
 
@@ -216,11 +229,12 @@ export class AgentBridgeClient {
     })
   }
 
-  getOutput(runId: string, cursor = 0, options: AgentBridgeRequestOptions = {}): Promise<AgentBridgeOutput> {
+  getOutput(runId: string, cursor = 0, eventCursor = 0, options: AgentBridgeRequestOptions = {}): Promise<AgentBridgeOutput> {
     return this.request<AgentBridgeOutput>({
       action: 'get_output',
       run_id: runId,
       cursor,
+      event_cursor: eventCursor,
     }, options)
   }
 
@@ -230,10 +244,12 @@ export class AgentBridgeClient {
   ): AsyncGenerator<AgentBridgeOutput> {
     const intervalMs = options.intervalMs || 100
     let cursor = 0
+    let eventCursor = 0
     for (;;) {
-      const chunk = await this.getOutput(runId, cursor, options)
+      const chunk = await this.getOutput(runId, cursor, eventCursor, options)
       cursor = chunk.cursor
-      if (chunk.delta || chunk.done) yield chunk
+      eventCursor = chunk.event_cursor
+      if (chunk.delta || chunk.done || (chunk.events && chunk.events.length > 0)) yield chunk
       if (chunk.done) return
       await delay(intervalMs)
     }
@@ -265,6 +281,14 @@ export class AgentBridgeClient {
 
   steer(sessionId: string, text: string): Promise<AgentBridgeResponse> {
     return this.request({ action: 'steer', session_id: sessionId, text })
+  }
+
+  approvalRespond(approvalId: string, choice: string): Promise<AgentBridgeResponse> {
+    return this.request({ action: 'approval_respond', approval_id: approvalId, choice })
+  }
+
+  destroyAll(): Promise<AgentBridgeResponse> {
+    return this.request({ action: 'destroy_all' })
   }
 
   getHistory(sessionId: string): Promise<AgentBridgeResponse> {

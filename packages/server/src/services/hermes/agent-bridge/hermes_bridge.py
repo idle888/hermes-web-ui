@@ -13,6 +13,7 @@ import argparse
 import copy
 import json
 import os
+import queue
 import shutil
 import socket
 import sys
@@ -21,13 +22,12 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any
 
 
-DEFAULT_ENDPOINT = "ipc:///tmp/hermes-agent-bridge.sock"
+DEFAULT_ENDPOINT = "tcp://127.0.0.1:18765" if os.name == "nt" else "ipc:///tmp/hermes-agent-bridge.sock"
 DEFAULT_AGENT_ROOT = "~/.hermes/hermes-agent"
 DEFAULT_HERMES_HOME = "~/.hermes"
 
@@ -133,9 +133,23 @@ def _hermes_home() -> Path:
     return _discover_hermes_home(os.environ.get("HERMES_HOME"))
 
 
+def _base_hermes_home() -> Path:
+    return _discover_hermes_home(os.environ.get("HERMES_AGENT_BRIDGE_BASE_HOME") or DEFAULT_HERMES_HOME)
+
+
+def _profile_home(profile: str | None) -> Path:
+    base = _base_hermes_home()
+    if not profile or profile == "default":
+        return base
+    profile_home = base / "profiles" / profile
+    return profile_home if profile_home.exists() else base
+
+
 def _set_path_env(agent_root: str | None = None, hermes_home: str | None = None) -> None:
     os.environ["HERMES_AGENT_ROOT"] = str(_discover_agent_root(agent_root))
-    os.environ["HERMES_HOME"] = str(_discover_hermes_home(hermes_home))
+    resolved_home = str(_discover_hermes_home(hermes_home))
+    os.environ["HERMES_HOME"] = resolved_home
+    os.environ["HERMES_AGENT_BRIDGE_BASE_HOME"] = resolved_home
 
 
 def _ensure_agent_imports() -> None:
@@ -146,9 +160,10 @@ def _ensure_agent_imports() -> None:
     if root_s not in sys.path:
         sys.path.insert(0, root_s)
     os.environ.setdefault("HERMES_HOME", str(_hermes_home()))
+    os.environ.setdefault("HERMES_AGENT_BRIDGE_BASE_HOME", str(_hermes_home()))
 
 
-def _load_cfg() -> dict[str, Any]:
+def _load_cfg(profile: str | None = None) -> dict[str, Any]:
     _ensure_agent_imports()
     try:
         from hermes_cli.config import load_config
@@ -165,6 +180,28 @@ def _load_cfg() -> dict[str, Any]:
             return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         except Exception:
             return {}
+
+
+def _apply_profile_env(profile: str | None) -> str | None:
+    """Temporarily set HERMES_HOME to the profile directory.
+    Returns the original HERMES_HOME value to restore later.
+    """
+    if not profile or profile == "default":
+        return os.environ.get("HERMES_HOME")
+    profile_home = _profile_home(profile)
+    if not (profile_home / "config.yaml").exists():
+        return os.environ.get("HERMES_HOME")
+    original = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = str(profile_home)
+    return original
+
+
+def _restore_profile_env(original: str | None) -> None:
+    """Restore HERMES_HOME after profile-scoped agent creation."""
+    if original is not None:
+        os.environ["HERMES_HOME"] = original
+    else:
+        os.environ.pop("HERMES_HOME", None)
 
 
 def _resolve_model(cfg: dict[str, Any]) -> str:
@@ -202,9 +239,20 @@ def _load_enabled_toolsets() -> list[str] | None:
     try:
         from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
+        from toolsets import resolve_toolset
 
         cfg = load_config()
-        enabled = sorted(_get_platform_tools(cfg, "cli", include_default_mcp_servers=True))
+        platform = _bridge_platform()
+        enabled = sorted(_get_platform_tools(cfg, platform, include_default_mcp_servers=True))
+        if platform != "cli":
+            resolved_tools: set[str] = set()
+            for toolset_name in enabled:
+                try:
+                    resolved_tools.update(resolve_toolset(toolset_name))
+                except Exception:
+                    pass
+            if not resolved_tools:
+                enabled = sorted(_get_platform_tools(cfg, "cli", include_default_mcp_servers=True))
         return enabled or None
     except Exception:
         return None
@@ -245,27 +293,33 @@ def _cfg_max_turns(cfg: dict[str, Any], default: int = 90) -> int:
 class SessionDbHolder:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._db = None
+        self._db_by_path: dict[str, Any] = {}
         self._error: str | None = None
 
-    def get(self):
+    def get(self, db_path: Path | None = None):
         with self._lock:
-            if self._db is not None:
-                return self._db
+            key = str((db_path or (_base_hermes_home() / "state.db")).resolve())
+            if key in self._db_by_path:
+                return self._db_by_path[key]
             _ensure_agent_imports()
             try:
                 from hermes_state import SessionDB
 
-                self._db = SessionDB()
+                db = SessionDB(db_path=Path(key))
+                self._db_by_path[key] = db
                 self._error = None
+                return db
             except Exception as exc:
                 self._error = str(exc)
-                self._db = None
-            return self._db
+                return None
 
     @property
     def error(self) -> str | None:
         return self._error
+
+    def get_for_profile(self, profile: str | None) -> Any:
+        """Get a SessionDB for the given profile using an explicit DB path."""
+        return self.get(_profile_home(profile) / "state.db")
 
 
 @dataclass
@@ -300,103 +354,95 @@ class AgentPool:
         self._runs: dict[str, RunRecord] = {}
         self._lock = threading.RLock()
         self._db = SessionDbHolder()
-
-    def _load_history(self, session_id: str) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
-        db = self._db.get()
-        if db is None:
-            return session_id, [], None
-
-        resolved_session_id = session_id
-        try:
-            if hasattr(db, "resolve_resume_session_id"):
-                resolved_session_id = db.resolve_resume_session_id(session_id)
-        except Exception:
-            resolved_session_id = session_id
-
-        session_row = None
-        try:
-            if hasattr(db, "get_session"):
-                session_row = db.get_session(resolved_session_id)
-        except Exception:
-            session_row = None
-
-        history: list[dict[str, Any]] = []
-        try:
-            if hasattr(db, "get_messages_as_conversation"):
-                history = db.get_messages_as_conversation(
-                    resolved_session_id,
-                    include_ancestors=True,
-                )
-        except Exception:
-            history = []
-        return resolved_session_id, _jsonable(history), _jsonable(session_row)
+        self._approval_requests: dict[str, queue.Queue[str]] = {}
 
     def get_or_create(
         self,
         session_id: str,
+        profile: str | None = None,
     ) -> AgentSession:
         with self._lock:
             existing = self._sessions.get(session_id)
             if existing is not None:
-                existing.last_used_at = time.time()
-                return existing
+                # If profile changed, destroy old session and recreate
+                if profile and existing.config.get("profile") != profile:
+                    if not existing.running:
+                        self._destroy_session(session_id)
+                    else:
+                        existing.last_used_at = time.time()
+                        return existing
+                else:
+                    existing.last_used_at = time.time()
+                    return existing
 
             _ensure_agent_imports()
             from run_agent import AIAgent
 
-            cfg = _load_cfg()
-            resolved_model = _resolve_model(cfg)
-            runtime = _resolve_runtime(resolved_model)
-            agent_cfg = cfg.get("agent") or {}
-            prompt = str(agent_cfg.get("system_prompt", "") or "").strip() or None
-            resolved_session_id, history, session_row = self._load_history(session_id)
+            original_home = _apply_profile_env(profile)
+            try:
+                cfg = _load_cfg()
+                resolved_model = _resolve_model(cfg)
+                runtime = _resolve_runtime(resolved_model)
+                agent_cfg = cfg.get("agent") or {}
+                prompt = str(agent_cfg.get("system_prompt", "") or "").strip() or None
 
-            agent = AIAgent(
-                model=resolved_model,
-                max_iterations=_cfg_max_turns(cfg, 90),
-                provider=runtime.get("provider"),
-                base_url=runtime.get("base_url"),
-                api_key=runtime.get("api_key"),
-                api_mode=runtime.get("api_mode"),
-                acp_command=runtime.get("command"),
-                acp_args=runtime.get("args"),
-                credential_pool=runtime.get("credential_pool"),
-                quiet_mode=True,
-                verbose_logging=False,
-                reasoning_config=_load_reasoning_config(),
-                service_tier=_load_service_tier(),
-                enabled_toolsets=_load_enabled_toolsets(),
-                platform=_bridge_platform(),
-                session_id=resolved_session_id,
-                session_db=self._db.get(),
-                ephemeral_system_prompt=prompt,
-                status_callback=self._status_callback(session_id),
-                thinking_callback=self._text_event_callback(session_id, "thinking.delta"),
-                reasoning_callback=self._text_event_callback(session_id, "reasoning.delta"),
-            )
+                agent = AIAgent(
+                    model=resolved_model,
+                    max_iterations=_cfg_max_turns(cfg, 90),
+                    provider=runtime.get("provider"),
+                    base_url=runtime.get("base_url"),
+                    api_key=runtime.get("api_key"),
+                    api_mode=runtime.get("api_mode"),
+                    acp_command=runtime.get("command"),
+                    acp_args=runtime.get("args"),
+                    credential_pool=runtime.get("credential_pool"),
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    reasoning_config=_load_reasoning_config(),
+                    service_tier=_load_service_tier(),
+                    enabled_toolsets=_load_enabled_toolsets(),
+                    platform=_bridge_platform(),
+                    session_id=session_id,
+                    session_db=self._db.get_for_profile(profile),
+                    ephemeral_system_prompt=prompt,
+                    status_callback=self._status_callback(session_id),
+                    thinking_callback=self._text_event_callback(session_id, "thinking.delta"),
+                    reasoning_callback=self._text_event_callback(session_id, "reasoning.delta"),
+                    tool_progress_callback=self._tool_progress_callback(session_id),
+                    tool_start_callback=self._tool_start_callback(session_id),
+                    tool_complete_callback=self._tool_complete_callback(session_id),
+                )
 
-            session = AgentSession(
-                session_id=resolved_session_id,
-                agent=agent,
-                history=history,
-                config={
-                    "requested_session_id": session_id,
-                    "resolved_session_id": resolved_session_id,
-                    "model": resolved_model,
-                    "resumed_model": session_row.get("model") if isinstance(session_row, dict) else None,
-                    "provider": runtime.get("provider"),
-                    "base_url": runtime.get("base_url"),
-                    "api_mode": runtime.get("api_mode"),
-                    "platform": _bridge_platform(),
-                    "resumed": bool(history),
-                    "resumed_message_count": len(history),
-                    "db_error": self._db.error,
-                },
-            )
-            self._sessions[session_id] = session
-            if resolved_session_id != session_id:
-                self._sessions[resolved_session_id] = session
-            return session
+                session = AgentSession(
+                    session_id=session_id,
+                    agent=agent,
+                    history=[],
+                    config={
+                        "requested_session_id": session_id,
+                        "profile": profile or "default",
+                        "model": resolved_model,
+                        "provider": runtime.get("provider"),
+                        "base_url": runtime.get("base_url"),
+                        "api_mode": runtime.get("api_mode"),
+                        "platform": _bridge_platform(),
+                        "resumed": False,
+                        "resumed_message_count": 0,
+                        "db_error": self._db.error,
+                    },
+                )
+                self._sessions[session_id] = session
+                return session
+            finally:
+                _restore_profile_env(original_home)
+
+    def _destroy_session(self, session_id: str) -> None:
+        session = self._sessions.pop(session_id, None)
+        if session is None:
+            return
+        with self._lock:
+            for rid in list(self._runs):
+                if self._runs[rid].session_id == session_id:
+                    del self._runs[rid]
 
     def _append_event(self, session_id: str, event: dict[str, Any]) -> None:
         with self._lock:
@@ -417,12 +463,195 @@ class AgentPool:
 
         return callback
 
+    def _tool_start_callback(self, session_id: str):
+        def callback(tool_call_id, function_name, function_args):
+            self._append_event(session_id, {
+                "event": "tool.started",
+                "tool_call_id": str(tool_call_id) if tool_call_id else "",
+                "tool_name": str(function_name) if function_name else "",
+                "args": _jsonable(function_args) if function_args else {},
+            })
+
+        return callback
+
+    def _tool_complete_callback(self, session_id: str):
+        def callback(tool_call_id, function_name, function_args, function_result=None):
+            result_text = "" if function_result is None else str(function_result)
+            print(
+                "[hermes_bridge] tool_complete_callback "
+                f"session={session_id} tool={function_name} "
+                f"tool_call_id={tool_call_id} result_none={function_result is None} "
+                f"result_len={len(result_text)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._append_event(session_id, {
+                "event": "tool.completed",
+                "tool_call_id": str(tool_call_id) if tool_call_id else "",
+                "tool_name": str(function_name) if function_name else "",
+                "args": _jsonable(function_args) if function_args else {},
+                "result": _jsonable(function_result) if function_result is not None else None,
+                "result_preview": str(function_result)[:500] if function_result else None,
+            })
+
+        return callback
+
+    def _tool_progress_callback(self, session_id: str):
+        def callback(event_type, function_name=None, preview=None, function_args=None, **kwargs):
+            if event_type in (None, "tool.started", "tool.completed"):
+                print(
+                    "[hermes_bridge] tool_progress_callback "
+                    f"session={session_id} event={event_type} tool={function_name} "
+                    f"kwargs_keys={sorted(kwargs.keys())} "
+                    f"preview_len={len(str(preview)) if preview is not None else 0}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if event_type == "reasoning.available":
+                self._append_event(session_id, {
+                    "event": "reasoning.available",
+                    "text": str(preview) if preview else "",
+                })
+                return
+
+            if event_type == "_thinking":
+                text = function_name
+                if text:
+                    self._append_event(session_id, {
+                        "event": "reasoning.delta",
+                        "text": str(text),
+                    })
+                return
+
+            if event_type in (None, "tool.started"):
+                # AIAgent also calls tool_start_callback with the real tool_call_id.
+                # Use that event as canonical so resume/replay can match results.
+                return
+
+            if event_type == "tool.completed":
+                # AIAgent sends the full function_result to tool_complete_callback.
+                return
+
+        return callback
+
+    def _step_callback(self, session_id: str):
+        def callback(step_info=None):
+            self._append_event(session_id, {
+                "event": "step",
+                "step_info": _jsonable(step_info) if step_info else None,
+            })
+
+        return callback
+
+    def _stream_delta_callback(self, session_id: str):
+        def callback(delta=None):
+            if delta is None:
+                # Turn boundary signal (tools about to execute)
+                self._append_event(session_id, {
+                    "event": "turn.boundary",
+                })
+                return
+            if delta:
+                self._append_event(session_id, {
+                    "event": "stream.delta",
+                    "delta": str(delta),
+                })
+
+        return callback
+
+    def _approval_callback(self, session_id: str):
+        def callback(command: str, description: str, *, allow_permanent: bool = True) -> str:
+            approval_id = uuid.uuid4().hex
+            response_queue: queue.Queue[str] = queue.Queue(maxsize=1)
+            with self._lock:
+                self._approval_requests[approval_id] = response_queue
+            choices = ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+            self._append_event(session_id, {
+                "event": "approval.requested",
+                "approval_id": approval_id,
+                "command": str(command or ""),
+                "description": str(description or ""),
+                "choices": choices,
+                "allow_permanent": bool(allow_permanent),
+                "timeout_ms": 60_000,
+            })
+            try:
+                choice = response_queue.get(timeout=60)
+            except queue.Empty:
+                choice = "deny"
+            finally:
+                with self._lock:
+                    self._approval_requests.pop(approval_id, None)
+            self._append_event(session_id, {
+                "event": "approval.resolved",
+                "approval_id": approval_id,
+                "choice": choice,
+            })
+            return choice
+
+        return callback
+
+    def _prepersist_user_message(
+        self,
+        session: AgentSession,
+        message: Any,
+        conversation_history: list[dict[str, Any]] | None,
+        profile: str | None,
+    ) -> bool:
+        user_content = str(message) if not isinstance(message, dict) else str(message.get("content", message))
+        if not user_content.strip():
+            return False
+
+        db = self._db.get_for_profile(profile)
+        if db is None:
+            return False
+
+        try:
+            if hasattr(db, "create_session"):
+                db.create_session(
+                    session_id=session.session_id,
+                    source=_bridge_platform(),
+                    model=session.config.get("model"),
+                )
+
+            if hasattr(db, "get_messages"):
+                messages = db.get_messages(session.session_id)
+                if messages:
+                    last = messages[-1]
+                    if last.get("role") == "user" and last.get("content") == user_content:
+                        return False
+
+            db.append_message(
+                session_id=session.session_id,
+                role="user",
+                content=user_content,
+            )
+
+            # AIAgent will build messages as conversation_history + current user.
+            # Since the current user was pre-persisted above, advance its flush
+            # cursor so the normal end-of-turn flush only writes assistant/tool
+            # messages for this turn.
+            history_len = len(conversation_history) if conversation_history else 0
+            try:
+                session.agent._last_flushed_db_idx = max(
+                    int(getattr(session.agent, "_last_flushed_db_idx", 0) or 0),
+                    history_len + 1,
+                )
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
     def start_chat(
         self,
         session_id: str,
         message: Any,
+        instructions: str | None = None,
+        conversation_history: list[dict[str, Any]] | None = None,
+        profile: str | None = None,
     ) -> RunRecord:
-        session = self.get_or_create(session_id)
+        session = self.get_or_create(session_id, profile=profile)
         with session.lock:
             if session.running:
                 raise RuntimeError(f"session {session_id} is already running")
@@ -436,26 +665,44 @@ class AgentPool:
 
         thread = threading.Thread(
             target=self._run_chat,
-            args=(session, record, message),
+            args=(session, record, message, instructions, conversation_history, profile),
             daemon=True,
             name=f"hermes-bridge-run-{run_id[:8]}",
         )
         thread.start()
         return record
 
-    def _run_chat(self, session: AgentSession, record: RunRecord, message: Any) -> None:
+    def _run_chat(self, session: AgentSession, record: RunRecord, message: Any, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None) -> None:
         def stream_callback(delta: str) -> None:
             with self._lock:
                 record.deltas.append(str(delta))
 
         try:
-            with session.lock:
-                history = copy.deepcopy(session.history)
+            previous_approval_callback = None
+            previous_exec_ask = os.environ.get("HERMES_EXEC_ASK")
+            approval_session_token = None
+            try:
+                from tools.terminal_tool import _get_approval_callback, set_approval_callback
+                from tools.approval import set_current_session_key
+
+                previous_approval_callback = _get_approval_callback()
+                set_approval_callback(self._approval_callback(session.session_id))
+                approval_session_token = set_current_session_key(session.session_id)
+                os.environ["HERMES_EXEC_ASK"] = "1"
+            except Exception:
+                previous_approval_callback = None
+            self._prepersist_user_message(session, message, conversation_history, profile)
+            kwargs: dict[str, Any] = dict(
+                task_id=session.session_id,
+                stream_callback=stream_callback,
+            )
+            if instructions:
+                kwargs["system_message"] = instructions
+            if conversation_history is not None:
+                kwargs["conversation_history"] = conversation_history
             result = session.agent.run_conversation(
                 message,
-                conversation_history=history,
-                task_id=record.run_id,
-                stream_callback=stream_callback,
+                **kwargs,
             )
             result = _jsonable(result if isinstance(result, dict) else {"value": result})
             with session.lock:
@@ -476,6 +723,24 @@ class AgentPool:
                 session.running = False
                 session.current_run_id = None
                 session.last_used_at = time.time()
+        finally:
+            try:
+                from tools.terminal_tool import set_approval_callback
+
+                set_approval_callback(previous_approval_callback)
+            except Exception:
+                pass
+            if approval_session_token is not None:
+                try:
+                    from tools.approval import reset_current_session_key
+
+                    reset_current_session_key(approval_session_token)
+                except Exception:
+                    pass
+            if previous_exec_ask is None:
+                os.environ.pop("HERMES_EXEC_ASK", None)
+            else:
+                os.environ["HERMES_EXEC_ASK"] = previous_exec_ask
 
     def interrupt(self, session_id: str, message: str | None = None) -> dict[str, Any]:
         with self._lock:
@@ -496,6 +761,20 @@ class AgentPool:
             raise RuntimeError("agent does not support steer")
         accepted = bool(session.agent.steer(text))
         return {"status": "queued" if accepted else "rejected", "accepted": accepted, "text": text}
+
+    def respond_approval(self, approval_id: str, choice: str) -> dict[str, Any]:
+        cleaned = str(choice or "deny").strip().lower()
+        if cleaned not in {"once", "session", "always", "deny"}:
+            cleaned = "deny"
+        with self._lock:
+            response_queue = self._approval_requests.get(approval_id)
+        if response_queue is None:
+            return {"approval_id": approval_id, "resolved": False, "choice": cleaned}
+        try:
+            response_queue.put_nowait(cleaned)
+        except queue.Full:
+            pass
+        return {"approval_id": approval_id, "resolved": True, "choice": cleaned}
 
     def get_history(self, session_id: str) -> dict[str, Any]:
         with self._lock:
@@ -523,7 +802,7 @@ class AgentPool:
             "error": record.error,
         }
 
-    def get_output(self, run_id: str, cursor: int = 0) -> dict[str, Any]:
+    def get_output(self, run_id: str, cursor: int = 0, event_cursor: int = 0) -> dict[str, Any]:
         with self._lock:
             record = self._runs.get(run_id)
         if record is None:
@@ -531,6 +810,10 @@ class AgentPool:
         cursor = max(0, int(cursor or 0))
         deltas = list(record.deltas)
         next_cursor = len(deltas)
+        event_cursor = max(0, int(event_cursor or 0))
+        events = list(record.events)
+        new_events = _jsonable(events[event_cursor:])
+        next_event_cursor = len(events)
         return {
             "run_id": record.run_id,
             "session_id": record.session_id,
@@ -541,6 +824,8 @@ class AgentPool:
             "done": record.status != "running",
             "result": record.result if record.status != "running" else None,
             "error": record.error,
+            "events": new_events,
+            "event_cursor": next_event_cursor,
         }
 
     def destroy(self, session_id: str) -> dict[str, Any]:
@@ -555,196 +840,14 @@ class AgentPool:
                 pass
         return {"session_id": session_id, "destroyed": True}
 
-    def reset(self, session_id: str, title: str | None = None) -> dict[str, Any]:
+    def destroy_all(self) -> dict[str, Any]:
         with self._lock:
-            session = self._sessions.get(session_id)
-        if session is not None and session.running:
-            raise RuntimeError(f"session {session_id} is running")
-
-        self.destroy(session_id)
-        new_session_id = uuid.uuid4().hex
-        session = self.get_or_create(new_session_id)
-        if title and self._db.get() is not None:
-            try:
-                self._db.get().set_session_title(new_session_id, title)
-            except Exception:
-                pass
-        return {
-            "session_id": session_id,
-            "new_session_id": new_session_id,
-            "status": "reset",
-            "message": f"Started new CLI session {new_session_id}",
-            "config": session.config,
-        }
-
-    def clear(self, session_id: str) -> dict[str, Any]:
-        return self.reset(session_id)
-
-    def save(self, session_id: str) -> dict[str, Any]:
-        session = self._sessions.get(session_id)
-        if session is None:
-            raise KeyError(f"unknown session: {session_id}")
-        with session.lock:
-            history = copy.deepcopy(session.history)
-            config = copy.deepcopy(session.config)
-        if not history:
-            return {"session_id": session_id, "saved": False, "message": "No conversation to save."}
-        saved_dir = _hermes_home() / "sessions" / "saved"
-        saved_dir.mkdir(parents=True, exist_ok=True)
-        path = saved_dir / f"hermes_conversation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        path.write_text(json.dumps({
-            "session_id": session_id,
-            "model": config.get("model"),
-            "messages": history,
-        }, indent=2, ensure_ascii=False), encoding="utf-8")
-        return {"session_id": session_id, "saved": True, "path": str(path), "message": f"Conversation snapshot saved to: {path}"}
-
-    def _last_user_index(self, history: list[dict[str, Any]]) -> int | None:
-        for idx in range(len(history) - 1, -1, -1):
-            if history[idx].get("role") == "user":
-                return idx
-        return None
-
-    def undo(self, session_id: str) -> dict[str, Any]:
-        session = self._sessions.get(session_id)
-        if session is None:
-            raise KeyError(f"unknown session: {session_id}")
-        with session.lock:
-            idx = self._last_user_index(session.history)
-            if idx is None:
-                return {"session_id": session_id, "undone": False, "message": "No user message found to undo.", "history": copy.deepcopy(session.history)}
-            removed = len(session.history) - idx
-            session.history = session.history[:idx]
-            history = copy.deepcopy(session.history)
-        return {"session_id": session_id, "undone": True, "removed": removed, "message": f"Undid {removed} message(s).", "history": history}
-
-    def retry(self, session_id: str) -> dict[str, Any]:
-        session = self._sessions.get(session_id)
-        if session is None:
-            raise KeyError(f"unknown session: {session_id}")
-        with session.lock:
-            idx = self._last_user_index(session.history)
-            if idx is None:
-                return {"session_id": session_id, "retry": False, "message": "No user message found to retry.", "history": copy.deepcopy(session.history)}
-            retry_input = copy.deepcopy(session.history[idx].get("content", ""))
-            session.history = session.history[:idx]
-            history = copy.deepcopy(session.history)
-        return {"session_id": session_id, "retry": True, "retry_input": retry_input, "message": "Retrying last user message.", "history": history}
-
-    def title(self, session_id: str, title: str) -> dict[str, Any]:
-        cleaned = title.strip()
-        if not cleaned:
-            return {"session_id": session_id, "updated": False, "message": "Usage: /title <your session title>"}
-        db = self._db.get()
-        if db is not None:
-            try:
-                if hasattr(db, "set_session_title"):
-                    db.set_session_title(session_id, cleaned)
-            except Exception:
-                pass
-        return {"session_id": session_id, "updated": True, "title": cleaned, "message": f"Session title set: {cleaned}"}
-
-    def branch(self, session_id: str, title: str | None = None) -> dict[str, Any]:
-        session = self._sessions.get(session_id)
-        if session is None:
-            raise KeyError(f"unknown session: {session_id}")
-        with session.lock:
-            if session.running:
-                raise RuntimeError(f"session {session_id} is running")
-            history = copy.deepcopy(session.history)
-            config = copy.deepcopy(session.config)
-        if not history:
-            return {"session_id": session_id, "branched": False, "message": "No conversation to branch."}
-
-        new_session_id = uuid.uuid4().hex
-        db = self._db.get()
-        if db is not None:
-            try:
-                db.end_session(session_id, "branched")
-            except Exception:
-                pass
-            try:
-                db.create_session(
-                    session_id=new_session_id,
-                    source=_bridge_platform(),
-                    model=config.get("model"),
-                    model_config={"max_iterations": config.get("max_turns")},
-                    parent_session_id=session_id,
-                )
-                for msg in history:
-                    db.append_message(
-                        session_id=new_session_id,
-                        role=msg.get("role", "user"),
-                        content=msg.get("content"),
-                        tool_name=msg.get("tool_name") or msg.get("name"),
-                        tool_calls=msg.get("tool_calls"),
-                        tool_call_id=msg.get("tool_call_id"),
-                        reasoning=msg.get("reasoning"),
-                    )
-                if title:
-                    db.set_session_title(new_session_id, title)
-            except Exception:
-                pass
-
-        new_session = self.get_or_create(new_session_id)
-        with new_session.lock:
-            new_session.history = history
-        return {
-            "session_id": session_id,
-            "new_session_id": new_session_id,
-            "branched": True,
-            "history": history,
-            "message": f"Branched session {new_session_id}",
-        }
-
-    def compress(self, session_id: str, focus: str | None = None) -> dict[str, Any]:
-        session = self._sessions.get(session_id)
-        if session is None:
-            raise KeyError(f"unknown session: {session_id}")
-        with session.lock:
-            if session.running:
-                raise RuntimeError(f"session {session_id} is running")
-            history = copy.deepcopy(session.history)
-        if len(history) < 4:
-            return {"session_id": session_id, "compressed": False, "message": "Not enough conversation to compress (need at least 4 messages).", "history": history}
-        if not getattr(session.agent, "compression_enabled", False):
-            return {"session_id": session_id, "compressed": False, "message": "Compression is disabled in config.", "history": history}
-        if not hasattr(session.agent, "_compress_context"):
-            return {"session_id": session_id, "compressed": False, "message": "Agent does not expose manual compression.", "history": history}
-        compressed, _ = session.agent._compress_context(history, None, focus_topic=focus or None)
-        compressed = _jsonable(compressed)
-        with session.lock:
-            session.history = compressed
-        return {
-            "session_id": session_id,
-            "compressed": True,
-            "before": len(history),
-            "after": len(compressed),
-            "history": copy.deepcopy(compressed),
-            "message": f"Compressed {len(history)} messages to {len(compressed)} messages.",
-        }
-
-    def history_summary(self, session_id: str) -> dict[str, Any]:
-        result = self.get_history(session_id)
-        history = result.get("history") or []
-        lines = []
-        visible = 0
-        hidden_tools = 0
-        for msg in history:
-            role = msg.get("role", "unknown")
-            if role == "tool":
-                hidden_tools += 1
-                continue
-            if role not in {"user", "assistant"}:
-                continue
-            visible += 1
-            label = "You" if role == "user" else "Hermes"
-            content = str(msg.get("content") or "")
-            preview = content[:400] + ("..." if len(content) > 400 else "")
-            lines.append(f"[{label} #{visible}] {preview or '(no text response)'}")
-        if hidden_tools:
-            lines.append(f"[Tools] ({hidden_tools} tool message(s) hidden)")
-        return {"session_id": session_id, "history": history, "message": "\n\n".join(lines) if lines else "No conversation history yet."}
+            ids = list(self._sessions.keys())
+        destroyed = []
+        for sid in ids:
+            result = self.destroy(sid)
+            destroyed.append(result)
+        return {"destroyed": len(destroyed)}
 
     def status(self, session_id: str) -> dict[str, Any]:
         with self._lock:
@@ -768,66 +871,6 @@ class AgentPool:
                 "config": session.config,
             }
 
-    def command(self, session_id: str, command: str) -> dict[str, Any]:
-        raw = str(command or "").strip()
-        if not raw:
-            raise ValueError("command is required")
-        if not raw.startswith("/"):
-            raw = f"/{raw}"
-
-        name, _, rest = raw[1:].partition(" ")
-        name = name.strip().lower()
-        args = rest.strip()
-
-        if name in {"new", "reset"}:
-            return {
-                "command": raw,
-                "handled": True,
-                **self.reset(session_id, args or None),
-            }
-        if name == "clear":
-            return {"command": raw, "handled": True, **self.clear(session_id)}
-        if name == "redraw":
-            return {"command": raw, "handled": True, "message": "UI redraw requested."}
-        if name == "history":
-            return {"command": raw, "handled": True, **self.history_summary(session_id)}
-        if name == "save":
-            return {"command": raw, "handled": True, **self.save(session_id)}
-        if name == "retry":
-            return {"command": raw, "handled": True, **self.retry(session_id)}
-        if name == "undo":
-            return {"command": raw, "handled": True, **self.undo(session_id)}
-        if name == "title":
-            return {"command": raw, "handled": True, **self.title(session_id, args)}
-        if name in {"branch", "fork"}:
-            return {"command": raw, "handled": True, **self.branch(session_id, args or None)}
-        if name == "compress":
-            return {"command": raw, "handled": True, **self.compress(session_id, args or None)}
-        if name == "stop":
-            try:
-                result = self.interrupt(session_id, "Stopped by slash command")
-            except KeyError:
-                result = {"session_id": session_id, "status": "idle"}
-            return {"command": raw, "handled": True, "message": "Stop requested", **result}
-        if name == "steer":
-            if not args:
-                return {"command": raw, "handled": True, "accepted": False, "message": "Usage: /steer <prompt>"}
-            return {"command": raw, "handled": True, **self.steer(session_id, args)}
-        if name == "status":
-            return {"command": raw, "handled": True, **self.status(session_id)}
-        if name in {"help", "?"}:
-            return {
-                "command": raw,
-                "handled": True,
-                "message": "Supported bridge commands: /new, /reset, /stop, /steer <prompt>, /status, /help",
-            }
-
-        return {
-            "command": raw,
-            "handled": False,
-            "message": f"Slash command {raw.split()[0]} is not implemented in the Web UI CLI bridge yet.",
-        }
-
     def list_sessions(self) -> dict[str, Any]:
         with self._lock:
             sessions = list(self._sessions.values())
@@ -848,10 +891,14 @@ class AgentPool:
 
 
 class BridgeServer:
+    IDLE_TIMEOUT_SECONDS = 30 * 60  # 30 minutes
+    GC_INTERVAL_SECONDS = 60  # check every minute
+
     def __init__(self, endpoint: str) -> None:
         self.endpoint = endpoint
         self.pool = AgentPool()
         self._stop = threading.Event()
+        self._last_gc = time.time()
 
     def handle(self, req: dict[str, Any]) -> dict[str, Any]:
         action = str(req.get("action") or "").strip()
@@ -864,7 +911,10 @@ class BridgeServer:
         if action == "chat":
             session_id = str(req.get("session_id") or "").strip() or uuid.uuid4().hex
             message = req.get("message", req.get("input", ""))
-            record = self.pool.start_chat(session_id, message)
+            instructions = req.get("instructions") or req.get("system_message")
+            conversation_history = req.get("conversation_history")
+            profile = req.get("profile")
+            record = self.pool.start_chat(session_id, message, instructions, conversation_history, profile)
             if req.get("wait"):
                 timeout = float(req.get("timeout", 0) or 0)
                 deadline = time.time() + timeout if timeout > 0 else None
@@ -875,12 +925,6 @@ class BridgeServer:
                 return self.pool.get_result(record.run_id)
             return {"run_id": record.run_id, "session_id": session_id, "status": record.status}
 
-        if action == "command":
-            session_id = str(req.get("session_id") or "").strip()
-            if not session_id:
-                raise ValueError("session_id is required")
-            return self.pool.command(session_id, str(req.get("command") or req.get("text") or ""))
-
         if action == "get_result":
             return self.pool.get_result(str(req.get("run_id") or ""))
 
@@ -888,6 +932,7 @@ class BridgeServer:
             return self.pool.get_output(
                 str(req.get("run_id") or ""),
                 int(req.get("cursor") or 0),
+                int(req.get("event_cursor") or 0),
             )
 
         if action == "interrupt":
@@ -899,11 +944,20 @@ class BridgeServer:
                 raise ValueError("text is required")
             return self.pool.steer(str(req.get("session_id") or ""), text)
 
+        if action == "approval_respond":
+            approval_id = str(req.get("approval_id") or "").strip()
+            if not approval_id:
+                raise ValueError("approval_id is required")
+            return self.pool.respond_approval(approval_id, str(req.get("choice") or "deny"))
+
         if action == "get_history":
             return self.pool.get_history(str(req.get("session_id") or ""))
 
         if action == "destroy":
             return self.pool.destroy(str(req.get("session_id") or ""))
+
+        if action == "destroy_all":
+            return self.pool.destroy_all()
 
         if action == "list":
             return self.pool.list_sessions()
@@ -960,6 +1014,20 @@ class BridgeServer:
         payload = json.dumps(resp, ensure_ascii=False, default=str) + "\n"
         conn.sendall(payload.encode("utf-8"))
 
+    def _gc_idle_sessions(self) -> None:
+        """Destroy sessions idle longer than IDLE_TIMEOUT_SECONDS."""
+        now = time.time()
+        if now - self._last_gc < self.GC_INTERVAL_SECONDS:
+            return
+        self._last_gc = now
+        with self.pool._lock:
+            idle_ids = [
+                sid for sid, s in self.pool._sessions.items()
+                if not s.running and now - s.last_used_at > self.IDLE_TIMEOUT_SECONDS
+            ]
+        for sid in idle_ids:
+            self.pool.destroy(sid)
+
     def serve_forever(self) -> None:
         server = self._make_server_socket()
         server.listen(16)
@@ -972,6 +1040,7 @@ class BridgeServer:
                 try:
                     conn, _addr = server.accept()
                 except socket.timeout:
+                    self._gc_idle_sessions()
                     continue
                 try:
                     req = self._read_request(conn)

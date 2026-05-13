@@ -1,19 +1,16 @@
 import * as hermesCli from '../../services/hermes/hermes-cli'
-import { listConversationSummaries, getConversationDetail } from '../../services/hermes/conversations'
-import { listConversationSummariesFromDb, getConversationDetailFromDb } from '../../db/hermes/conversations-db'
-import { listSessionSummaries, searchSessionSummaries, getUsageStatsFromDb, getSessionDetailFromDb, type HermesSessionRow } from '../../db/hermes/sessions-db'
+import { listSessionSummaries, getUsageStatsFromDb, getSessionDetailFromDb } from '../../db/hermes/sessions-db'
 import {
   listSessions as localListSessions,
   searchSessions as localSearchSessions,
   getSessionDetail as localGetSessionDetail,
   deleteSession as localDeleteSession,
   renameSession as localRenameSession,
-  useLocalSessionStore,
 } from '../../db/hermes/session-store'
 import { ExportCompressor } from '../../lib/context-compressor/export-compressor'
 import { getGatewayManagerInstance } from '../../services/gateway-bootstrap'
 import { deleteUsage, getUsage, getUsageBatch, getLocalUsageStats } from '../../db/hermes/usage-store'
-import type { LocalUsageStats, UsageStatsModelRow, UsageStatsDailyRow } from '../../db/hermes/usage-store'
+import type { UsageStatsModelRow, UsageStatsDailyRow } from '../../db/hermes/usage-store'
 import { getModelContextLength } from '../../services/hermes/model-context'
 import { getActiveProfileName } from '../../services/hermes/hermes-profile'
 import { getGroupChatServer } from '../../routes/hermes/group-chat'
@@ -36,146 +33,75 @@ function filterPendingDeletedConversationSummaries(items: ConversationSummary[])
 
 export async function listConversations(ctx: any) {
   const source = (ctx.query.source as string) || undefined
-  const humanOnly = (ctx.query.humanOnly as string) !== 'false' && ctx.query.humanOnly !== '0'
   const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : undefined
 
-  if (useLocalSessionStore()) {
-    const profile = getActiveProfileName()
-    const sessions = localListSessions(profile, source, limit && limit > 0 ? limit : 200)
-    const summaries: ConversationSummary[] = sessions.map(s => ({
-      id: s.id,
-      source: s.source,
-      model: s.model,
-      title: s.title,
-      started_at: s.started_at,
-      ended_at: s.ended_at,
-      last_active: s.last_active,
-      message_count: s.message_count,
-      tool_call_count: s.tool_call_count,
-      input_tokens: s.input_tokens,
-      output_tokens: s.output_tokens,
-      cache_read_tokens: s.cache_read_tokens,
-      cache_write_tokens: s.cache_write_tokens,
-      reasoning_tokens: s.reasoning_tokens,
-      billing_provider: s.billing_provider,
-      estimated_cost_usd: s.estimated_cost_usd,
-      actual_cost_usd: s.actual_cost_usd,
-      cost_status: s.cost_status,
-      preview: s.preview,
-      workspace: s.workspace || null,
-      is_active: s.ended_at == null && (Date.now() / 1000 - s.last_active) <= 300,
-      thread_session_count: 1,
-    }))
-    ctx.body = { sessions: filterPendingDeletedConversationSummaries(summaries) }
-    return
-  }
-
-  try {
-    const sessions = await listConversationSummariesFromDb({ source, humanOnly, limit })
-    ctx.body = { sessions: filterPendingDeletedConversationSummaries(sessions) }
-    return
-  } catch (err) {
-    logger.warn(err, 'Hermes Conversation DB: summary query failed, falling back to CLI export')
-  }
-
-  const sessions = await listConversationSummaries({ source, humanOnly, limit })
-  ctx.body = { sessions: filterPendingDeletedConversationSummaries(sessions) }
+  const profile = getActiveProfileName()
+  const sessions = localListSessions(profile, source, limit && limit > 0 ? limit : 200)
+  const summaries: ConversationSummary[] = sessions.map(s => ({
+    id: s.id,
+    source: s.source,
+    model: s.model,
+    title: s.title,
+    started_at: s.started_at,
+    ended_at: s.ended_at,
+    last_active: s.last_active,
+    message_count: s.message_count,
+    tool_call_count: s.tool_call_count,
+    input_tokens: s.input_tokens,
+    output_tokens: s.output_tokens,
+    cache_read_tokens: s.cache_read_tokens,
+    cache_write_tokens: s.cache_write_tokens,
+    reasoning_tokens: s.reasoning_tokens,
+    billing_provider: s.billing_provider,
+    estimated_cost_usd: s.estimated_cost_usd,
+    actual_cost_usd: s.actual_cost_usd,
+    cost_status: s.cost_status,
+    preview: s.preview,
+    workspace: s.workspace || null,
+    is_active: s.ended_at == null && (Date.now() / 1000 - s.last_active) <= 300,
+    thread_session_count: 1,
+  }))
+  ctx.body = { sessions: filterPendingDeletedConversationSummaries(summaries) }
 }
 
 export async function getConversationMessages(ctx: any) {
-  const source = (ctx.query.source as string) || undefined
   const humanOnly = (ctx.query.humanOnly as string) !== 'false' && ctx.query.humanOnly !== '0'
 
-  if (useLocalSessionStore()) {
-    const detail = localGetSessionDetail(ctx.params.id)
-    if (!detail) {
-      ctx.status = 404
-      ctx.body = { error: 'Conversation not found' }
-      return
-    }
-    const messages = detail.messages
-      .filter(m => {
-        if (humanOnly && m.role !== 'user' && m.role !== 'assistant') return false
-        if (!m.content) return false
-        return true
-      })
-      .map(m => ({
-        id: m.id,
-        session_id: m.session_id,
-        role: m.role as 'user' | 'assistant',
-        content: m.content,
-        timestamp: m.timestamp,
-      }))
-    ctx.body = {
-      session_id: ctx.params.id,
-      messages,
-      visible_count: messages.length,
-      thread_session_count: 1,
-    }
-    return
-  }
-
-  try {
-    const detail = await getConversationDetailFromDb(ctx.params.id, { source, humanOnly })
-    if (!detail) {
-      ctx.status = 404
-      ctx.body = { error: 'Conversation not found' }
-      return
-    }
-    ctx.body = detail
-    return
-  } catch (err) {
-    logger.warn(err, 'Hermes Conversation DB: detail query failed, falling back to CLI export')
-  }
-
-  const detail = await getConversationDetail(ctx.params.id, { source, humanOnly })
+  const detail = localGetSessionDetail(ctx.params.id)
   if (!detail) {
     ctx.status = 404
     ctx.body = { error: 'Conversation not found' }
     return
   }
-  ctx.body = detail
+  const messages = detail.messages
+    .filter(m => {
+      if (humanOnly && m.role !== 'user' && m.role !== 'assistant') return false
+      if (!m.content) return false
+      return true
+    })
+    .map(m => ({
+      id: m.id,
+      session_id: m.session_id,
+      role: m.role as 'user' | 'assistant',
+      content: m.content,
+      timestamp: m.timestamp,
+    }))
+  ctx.body = {
+    session_id: ctx.params.id,
+    messages,
+    visible_count: messages.length,
+    thread_session_count: 1,
+  }
 }
 
 export async function list(ctx: any) {
-  if (useLocalSessionStore()) {
-    const source = (ctx.query.source as string) || undefined
-    const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : undefined
-    const profile = getActiveProfileName()
-    const effectiveLimit = limit && limit > 0 ? limit : 2000
-
-    // Merge local store (api_server sessions) with Hermes state.db (cli + other sources)
-    const localSessions = localListSessions(profile, source, effectiveLimit)
-    let cliSessions: HermesSessionRow[] = []
-    try {
-      // Only fetch cli sessions from Hermes state.db (local store only has api_server)
-      const sourceFilter = source || 'cli'
-      cliSessions = await listSessionSummaries(sourceFilter, effectiveLimit, profile)
-      if (sourceFilter === 'cli') {
-        cliSessions = cliSessions.filter(s => s.source === 'cli')
-      }
-    } catch { /* state.db may not exist */ }
-
-    const seen = new Set(localSessions.map(s => s.id))
-    const merged = [...localSessions, ...cliSessions.filter(s => !seen.has(s.id))]
-    merged.sort((a, b) => Number(b.last_active || b.started_at || 0) - Number(a.last_active || a.started_at || 0))
-    ctx.body = { sessions: filterPendingDeletedSessions(merged.slice(0, effectiveLimit)) }
-    return
-  }
-
   const source = (ctx.query.source as string) || undefined
   const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : undefined
+  const profile = getActiveProfileName()
+  const effectiveLimit = limit && limit > 0 ? limit : 2000
 
-  try {
-    const sessions = await listSessionSummaries(source, limit && limit > 0 ? limit : 2000)
-    ctx.body = { sessions: filterPendingDeletedSessions(sessions) }
-    return
-  } catch (err) {
-    logger.warn(err, 'Hermes Session DB: summary query failed, falling back to CLI')
-  }
-
-  const sessions = await hermesCli.listSessions(source, limit)
-  ctx.body = { sessions: filterPendingDeletedSessions(sessions) }
+  const allSessions = localListSessions(profile, source, effectiveLimit)
+  ctx.body = { sessions: filterPendingDeletedSessions(allSessions.filter(s => s.source === 'api_server' || s.source === 'cli')) }
 }
 
 /**
@@ -185,68 +111,23 @@ export async function list(ctx: any) {
 export async function listHermesSessions(ctx: any) {
   const source = (ctx.query.source as string) || undefined
   const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : undefined
+  const profile = getActiveProfileName()
+  const effectiveLimit = limit && limit > 0 ? limit : 2000
 
-  try {
-    const sessions = await listSessionSummaries(source, limit && limit > 0 ? limit : 2000)
-    ctx.body = { sessions: filterPendingDeletedSessions(sessions.filter(s => s.source !== 'api_server' && s.source !== 'cli')) }
-    return
-  } catch (err) {
-    logger.warn(err, 'Hermes Session DB: summary query failed, falling back to CLI')
-  }
-
-  const sessions = await hermesCli.listSessions(source, limit)
-  ctx.body = { sessions: filterPendingDeletedSessions(sessions.filter(s => s.source !== 'api_server' && s.source !== 'cli')) }
+  const allSessions = localListSessions(profile, source, effectiveLimit)
+  ctx.body = { sessions: filterPendingDeletedSessions(allSessions.filter(s => s.source !== 'api_server')) }
 }
 
 export async function search(ctx: any) {
-  if (useLocalSessionStore()) {
-    const q = typeof ctx.query.q === 'string' ? ctx.query.q : ''
-    const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : undefined
-    const profile = getActiveProfileName()
-    const results = localSearchSessions(profile, q, limit && limit > 0 ? limit : 20)
-    ctx.body = { results: filterPendingDeletedSessions(results) }
-    return
-  }
-
   const q = typeof ctx.query.q === 'string' ? ctx.query.q : ''
-  const source = typeof ctx.query.source === 'string' && ctx.query.source.trim()
-    ? ctx.query.source.trim()
-    : undefined
   const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : undefined
-
-  try {
-    const results = await searchSessionSummaries(q, source, limit && limit > 0 ? limit : 20)
-    ctx.body = { results: filterPendingDeletedSessions(results) }
-  } catch (err) {
-    logger.error(err, 'Hermes Session DB: search failed')
-    ctx.status = 500
-    ctx.body = { error: 'Failed to search sessions' }
-  }
+  const profile = getActiveProfileName()
+  const results = localSearchSessions(profile, q, limit && limit > 0 ? limit : 20)
+  ctx.body = { results: filterPendingDeletedSessions(results) }
 }
 
 export async function get(ctx: any) {
-  if (useLocalSessionStore()) {
-    // Try local store first (api_server sessions)
-    const session = localGetSessionDetail(ctx.params.id)
-    if (session) {
-      ctx.body = { session }
-      return
-    }
-    // Fallback to Hermes state.db (cli sessions)
-    try {
-      const hermesSession = await getSessionDetailFromDb(ctx.params.id)
-      if (hermesSession) {
-        ctx.body = { session: hermesSession }
-        return
-      }
-    } catch { /* state.db may not exist */ }
-
-    ctx.status = 404
-    ctx.body = { error: 'Session not found' }
-    return
-  }
-
-  const session = await hermesCli.getSession(ctx.params.id)
+  const session = localGetSessionDetail(ctx.params.id)
   if (!session) {
     ctx.status = 404
     ctx.body = { error: 'Session not found' }
@@ -288,21 +169,8 @@ export async function getHermesSession(ctx: any) {
 }
 
 export async function remove(ctx: any) {
-  if (useLocalSessionStore()) {
-    const sessionId = ctx.params.id
-    const ok = localDeleteSession(sessionId)
-    if (!ok) {
-      ctx.status = 500
-      ctx.body = { error: 'Failed to delete session' }
-      return
-    }
-    deleteUsage(sessionId)
-    ctx.body = { ok: true }
-    return
-  }
-
   const sessionId = ctx.params.id
-  const ok = await hermesCli.deleteSession(sessionId)
+  const ok = localDeleteSession(sessionId)
   if (!ok) {
     ctx.status = 500
     ctx.body = { error: 'Failed to delete session' }
@@ -333,27 +201,14 @@ export async function batchRemove(ctx: any) {
     errors: [] as Array<{ id: string; error: string }>
   }
 
-  if (useLocalSessionStore()) {
-    for (const id of validIds) {
-      const ok = localDeleteSession(id)
-      if (ok) {
-        deleteUsage(id)
-        results.deleted++
-      } else {
-        results.failed++
-        results.errors.push({ id, error: 'Failed to delete session' })
-      }
-    }
-  } else {
-    for (const id of validIds) {
-      const ok = await hermesCli.deleteSession(id)
-      if (ok) {
-        deleteUsage(id)
-        results.deleted++
-      } else {
-        results.failed++
-        results.errors.push({ id, error: 'Failed to delete session' })
-      }
+  for (const id of validIds) {
+    const ok = localDeleteSession(id)
+    if (ok) {
+      deleteUsage(id)
+      results.deleted++
+    } else {
+      results.failed++
+      results.errors.push({ id, error: 'Failed to delete session' })
     }
   }
 
@@ -380,30 +235,13 @@ export async function usageSingle(ctx: any) {
 }
 
 export async function rename(ctx: any) {
-  if (useLocalSessionStore()) {
-    const { title } = ctx.request.body as { title?: string }
-    if (!title || typeof title !== 'string') {
-      ctx.status = 400
-      ctx.body = { error: 'title is required' }
-      return
-    }
-    const ok = localRenameSession(ctx.params.id, title.trim())
-    if (!ok) {
-      ctx.status = 500
-      ctx.body = { error: 'Failed to rename session' }
-      return
-    }
-    ctx.body = { ok: true }
-    return
-  }
-
   const { title } = ctx.request.body as { title?: string }
   if (!title || typeof title !== 'string') {
     ctx.status = 400
     ctx.body = { error: 'title is required' }
     return
   }
-  const ok = await hermesCli.renameSession(ctx.params.id, title.trim())
+  const ok = localRenameSession(ctx.params.id, title.trim())
   if (!ok) {
     ctx.status = 500
     ctx.body = { error: 'Failed to rename session' }
@@ -419,20 +257,14 @@ export async function setWorkspace(ctx: any) {
     ctx.body = { error: 'workspace must be a string or null' }
     return
   }
-  if (useLocalSessionStore()) {
-    const { updateSession, getSession, createSession } = await import('../../db/hermes/session-store')
-    const { getActiveProfileName } = await import('../../services/hermes/hermes-profile')
-    const id = ctx.params.id
-    // Create session if it doesn't exist yet (user may set workspace before sending first message)
-    if (!getSession(id)) {
-      createSession({ id, profile: getActiveProfileName(), title: '' })
-    }
-    updateSession(id, { workspace: workspace || null } as any)
-    ctx.body = { ok: true }
-    return
+  const { updateSession, getSession, createSession } = await import('../../db/hermes/session-store')
+  const { getActiveProfileName } = await import('../../services/hermes/hermes-profile')
+  const id = ctx.params.id
+  if (!getSession(id)) {
+    createSession({ id, profile: getActiveProfileName(), title: '' })
   }
-  ctx.status = 501
-  ctx.body = { error: 'Workspace setting only supported in local session store mode' }
+  updateSession(id, { workspace: workspace || null } as any)
+  ctx.body = { ok: true }
 }
 
 export async function contextLength(ctx: any) {
@@ -571,20 +403,7 @@ export async function listWorkspaceFolders(ctx: any) {
 const exportCompressor = new ExportCompressor()
 
 export async function exportSession(ctx: any) {
-  let session: any = null
-
-  if (useLocalSessionStore()) {
-    session = localGetSessionDetail(ctx.params.id)
-  } else {
-    try {
-      session = await getSessionDetailFromDb(ctx.params.id)
-    } catch (err) {
-      logger.warn(err, 'Hermes Session DB: export detail query failed, falling back to CLI')
-    }
-    if (!session) {
-      session = await hermesCli.getSession(ctx.params.id)
-    }
-  }
+  const session = localGetSessionDetail(ctx.params.id)
 
   if (!session) {
     ctx.status = 404
@@ -656,38 +475,32 @@ export async function getConversationMessagesPaginated(ctx: any) {
   const offset = ctx.query.offset ? parseInt(ctx.query.offset as string, 10) : 0
   const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : 50
 
-  if (useLocalSessionStore()) {
-    const { getSessionDetailPaginated } = await import('../../db/hermes/session-store')
-    const result = getSessionDetailPaginated(ctx.params.id, offset, limit)
+  const { getSessionDetailPaginated } = await import('../../db/hermes/session-store')
+  const result = getSessionDetailPaginated(ctx.params.id, offset, limit)
 
-    if (!result) {
-      ctx.status = 404
-      ctx.body = { error: 'Conversation not found' }
-      return
-    }
-
-    ctx.body = {
-      session: {
-        id: result.session.id,
-        source: result.session.source,
-        model: result.session.model,
-        title: result.session.title,
-        started_at: result.session.started_at,
-        ended_at: result.session.ended_at,
-        last_active: result.session.last_active,
-        message_count: result.session.message_count,
-        input_tokens: result.session.input_tokens,
-        output_tokens: result.session.output_tokens,
-      },
-      messages: result.messages,
-      total: result.total,
-      offset: result.offset,
-      limit: result.limit,
-      hasMore: result.hasMore,
-    }
+  if (!result) {
+    ctx.status = 404
+    ctx.body = { error: 'Conversation not found' }
     return
   }
 
-  ctx.status = 404
-  ctx.body = { error: 'Conversation not found' }
+  ctx.body = {
+    session: {
+      id: result.session.id,
+      source: result.session.source,
+      model: result.session.model,
+      title: result.session.title,
+      started_at: result.session.started_at,
+      ended_at: result.session.ended_at,
+      last_active: result.session.last_active,
+      message_count: result.session.message_count,
+      input_tokens: result.session.input_tokens,
+      output_tokens: result.session.output_tokens,
+    },
+    messages: result.messages,
+    total: result.total,
+    offset: result.offset,
+    limit: result.limit,
+    hasMore: result.hasMore,
+  }
 }

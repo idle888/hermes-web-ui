@@ -20,7 +20,6 @@ import { setGroupChatServer } from './routes/hermes/group-chat'
 import { setChatRunServer } from './routes/hermes/chat-run'
 import { GroupChatServer } from './services/hermes/group-chat'
 import { ChatRunSocket } from './services/hermes/chat-run-socket'
-import { CliChatRunSocket } from './services/hermes/cli-chat-run-socket'
 import { startAgentBridgeManager } from './services/hermes/agent-bridge'
 import { logger } from './services/logger'
 
@@ -48,7 +47,6 @@ process.on('unhandledRejection', (reason) => {
 let server: any = null
 let servers: any[] = []
 let chatRunServer: any = null
-let cliChatRunServer: any = null
 let agentBridgeManager: any = null
 
 interface ListenResult {
@@ -113,11 +111,6 @@ export async function bootstrap() {
   await new Promise(resolve => setTimeout(resolve, 1000))
   console.log('[bootstrap] all stores initialized')
 
-  // Sync Hermes sessions from all profiles (only if local DB is empty)
-  const { syncAllHermesSessionsOnStartup } = await import('./services/hermes/session-sync')
-  await syncAllHermesSessionsOnStartup()
-  console.log('[bootstrap] Hermes session sync completed')
-
   app.use(cors({ origin: config.corsOrigins }))
   app.use(bodyParser())
   console.log('[bootstrap] cors + bodyParser registered')
@@ -165,9 +158,6 @@ export async function bootstrap() {
   setChatRunServer(chatRunServer)
   chatRunServer.init()
 
-  cliChatRunServer = new CliChatRunSocket(groupChatServer.getIO())
-  cliChatRunServer.init()
-
   // Session deleter — periodically drain pending session deletes
   const { SessionDeleter } = await import('./services/hermes/session-deleter')
   const sessionDeleter = SessionDeleter.getInstance()
@@ -201,7 +191,7 @@ export async function bootstrap() {
     })
   })
 
-  bindShutdown(servers, groupChatServer, chatRunServer, agentBridgeManager, cliChatRunServer)
+  bindShutdown(servers, groupChatServer, chatRunServer, agentBridgeManager)
   startVersionCheck()
 }
 

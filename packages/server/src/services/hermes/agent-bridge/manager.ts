@@ -262,21 +262,23 @@ export class AgentBridgeManager {
 
       const cleanup = () => {
         clearTimeout(timeout)
-        child.stdout?.off('data', onStdout)
         child.off('exit', onExitBeforeReady)
         child.off('error', onError)
       }
 
       const onError = (err: Error) => {
         cleanup()
+        child.stdout?.off('data', onStdout)
         rejectReady(err)
       }
 
       const onExitBeforeReady = (code: number | null, signal: NodeJS.Signals | null) => {
         cleanup()
+        child.stdout?.off('data', onStdout)
         rejectReady(new Error(`agent bridge exited before ready code=${code} signal=${signal}`))
       }
 
+      let readyResolved = false
       const onStdout = (chunk: Buffer) => {
         const text = chunk.toString('utf8')
         buffered += text
@@ -287,15 +289,18 @@ export class AgentBridgeManager {
           buffered = buffered.slice(newline + 1)
           if (!line) continue
           logger.info('[agent-bridge] %s', line)
-          try {
-            const parsed = JSON.parse(line)
-            if (parsed?.event === 'ready') {
-              this.ready = true
-              cleanup()
-              resolveReady()
-              return
-            }
-          } catch {}
+          if (!readyResolved) {
+            try {
+              const parsed = JSON.parse(line)
+              if (parsed?.event === 'ready') {
+                this.ready = true
+                readyResolved = true
+                cleanup()
+                resolveReady()
+                return
+              }
+            } catch {}
+          }
         }
       }
 

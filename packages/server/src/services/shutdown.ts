@@ -27,7 +27,7 @@ function shouldStopGatewaysOnShutdown(signal: string): boolean {
   return shouldStop
 }
 
-export function bindShutdown(server: any, groupChatServer?: any, chatRunServer?: any, agentBridgeManager?: any, cliChatRunServer?: any): void {
+export function bindShutdown(server: any, groupChatServer?: any, chatRunServer?: any, agentBridgeManager?: any): void {
   let isShuttingDown = false
 
   const shutdown = async (signal: string) => {
@@ -71,11 +71,6 @@ export function bindShutdown(server: any, groupChatServer?: any, chatRunServer?:
       if (chatRunServer) {
         chatRunServer.close()
         logger.info('ChatRunSocket closed')
-      }
-
-      if (cliChatRunServer) {
-        cliChatRunServer.close()
-        logger.info('CliChatRunSocket closed')
       }
 
       // Disconnect Socket.IO before HTTP server to prevent hanging

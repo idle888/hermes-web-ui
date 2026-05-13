@@ -131,6 +131,7 @@ export default {
     contextEditSuccess: '上下文长度已更新',
     contextEditFailed: '更新失败',
     emptyState: '开始与 Hermes Agent 对话',
+    cliEmptyState: '开始 CLI 对话',
     inputPlaceholder: '输入消息... (Enter 发送，Shift+Enter 换行)',
     attachFiles: '添加附件',
     autoPlaySpeech: '自动播放语音',

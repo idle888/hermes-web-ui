@@ -17,6 +17,13 @@ Default endpoint:
 ipc:///tmp/hermes-agent-bridge.sock
 ```
 
+On Windows, the default endpoint is TCP because Python may not support Unix
+domain sockets there:
+
+```text
+tcp://127.0.0.1:18765
+```
+
 Override with:
 
 ```bash
