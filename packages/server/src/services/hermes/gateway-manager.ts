@@ -134,6 +134,15 @@ interface ResolvedGatewayEndpoint {
   host: string
 }
 
+type GatewayConfigSource = 'process-env' | 'profile-env' | 'config' | 'default'
+
+interface ResolvedGatewayRuntimeConfig extends ResolvedGatewayEndpoint {
+  apiKey: string | null
+  portSource: GatewayConfigSource
+  hostSource: GatewayConfigSource
+  apiKeySource: GatewayConfigSource | null
+}
+
 function formatHostForUrl(host: string): string {
   if (host.startsWith('[') && host.endsWith(']')) return host
   return host.includes(':') ? `[${host}]` : host
@@ -145,6 +154,39 @@ function buildHttpUrl(host: string, port: number): string {
 
 function isLocalHost(host: string): boolean {
   return ['127.0.0.1', 'localhost', '::1', '[::1]', '0.0.0.0'].includes(host)
+}
+
+function nonEmptyString(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed || null
+}
+
+function parsePort(value: unknown): number | null {
+  if (value === undefined || value === null || value === '') return null
+  if (typeof value === 'string' && !/^\d+$/.test(value.trim())) return null
+  const port = typeof value === 'number' ? value : Number(String(value).trim())
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null
+}
+
+function parseBoolean(value: unknown): boolean {
+  if (typeof value === 'boolean') return value
+  if (typeof value !== 'string') return false
+  return ['true', '1', 'yes', 'on'].includes(value.trim().toLowerCase())
+}
+
+function parseDotEnvValue(raw: string): string {
+  const trimmed = raw.trim()
+  if (!trimmed) return ''
+
+  const quote = trimmed[0]
+  if (quote === '"' || quote === "'") {
+    const end = trimmed.indexOf(quote, 1)
+    return (end === -1 ? trimmed.slice(1) : trimmed.slice(1, end)).trim()
+  }
+
+  const commentIndex = trimmed.search(/\s+#/)
+  return (commentIndex === -1 ? trimmed : trimmed.slice(0, commentIndex)).trim()
 }
 
 function shouldDetachGatewayProcess(): boolean {
@@ -190,29 +232,108 @@ export class GatewayManager {
     return join(HERMES_BASE, 'profiles', name)
   }
 
-  /**
-   * 从 profile 的 config.yaml 读取 api_server 端口和主机
-   * 读取路径：platforms.api_server.extra.port / extra.host
-   */
-  private readProfilePort(name: string): { port: number; host: string } {
+  private readProfileConfig(name: string): any {
     const configPath = join(this.profileDir(name), 'config.yaml')
-    const defaultHost = process.env.GATEWAY_HOST || '127.0.0.1'
-
-    if (!existsSync(configPath)) return { port: 8642, host: defaultHost }
+    if (!existsSync(configPath)) return {}
 
     try {
       const content = readFileSync(configPath, 'utf-8')
-      const cfg = yaml.load(content, { json: true }) as any || {}
-
-      const extra = cfg?.platforms?.api_server?.extra
-      const rawPort = extra?.port || 8642
-      const port = typeof rawPort === 'number' ? rawPort : parseInt(rawPort, 10) || 8642
-      const host = extra?.host || defaultHost
-      // 端口超出合法范围时回退到默认值
-      return { port: port > 0 && port <= 65535 ? port : 8642, host }
+      return (yaml.load(content, { json: true }) as any) || {}
     } catch {
-      return { port: 8642, host: defaultHost }
+      return {}
     }
+  }
+
+  private readProfileEnvValue(name: string, key: string): string | null {
+    try {
+      const envPath = join(this.profileDir(name), '.env')
+      if (!existsSync(envPath)) return null
+      const content = readFileSync(envPath, 'utf-8')
+      const pattern = new RegExp(`^\\s*(?:export\\s+)?${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=\\s*(.*)$`, 'm')
+      const match = content.match(pattern)
+      return match ? parseDotEnvValue(match[1]) || null : null
+    } catch {
+      return null
+    }
+  }
+
+  private isApiServerEnvOverrideActive(name: string): boolean {
+    return Boolean(
+      parseBoolean(process.env.API_SERVER_ENABLED) ||
+      nonEmptyString(process.env.API_SERVER_HOST) ||
+      nonEmptyString(process.env.API_SERVER_PORT) ||
+      nonEmptyString(process.env.API_SERVER_KEY) ||
+      parseBoolean(this.readProfileEnvValue(name, 'API_SERVER_ENABLED')) ||
+      nonEmptyString(this.readProfileEnvValue(name, 'API_SERVER_HOST')) ||
+      nonEmptyString(this.readProfileEnvValue(name, 'API_SERVER_PORT')) ||
+      nonEmptyString(this.readProfileEnvValue(name, 'API_SERVER_KEY')),
+    )
+  }
+
+  /**
+   * Resolve the effective API server endpoint and key exactly as the spawned
+   * Hermes gateway process will see them: container/process env first, then
+   * profile .env, then config.yaml, then WUI defaults.
+   */
+  private resolveGatewayRuntimeConfig(name: string): ResolvedGatewayRuntimeConfig {
+    const cfg = this.readProfileConfig(name)
+    const apiServer = cfg?.platforms?.api_server || {}
+    const extra = apiServer?.extra || {}
+    const defaultHost = nonEmptyString(process.env.GATEWAY_HOST) || '127.0.0.1'
+    const envOverridesActive = this.isApiServerEnvOverrideActive(name)
+
+    const configuredPort = parsePort(extra?.port ?? apiServer?.port)
+    const profileEnvPort = (envOverridesActive || configuredPort === null)
+      ? parsePort(this.readProfileEnvValue(name, 'API_SERVER_PORT'))
+      : null
+    const processEnvPort = (envOverridesActive || configuredPort === null)
+      ? parsePort(process.env.API_SERVER_PORT)
+      : null
+    const configPort = configuredPort ?? 8642
+    const port = processEnvPort ?? profileEnvPort ?? configPort
+    const portSource: GatewayConfigSource = processEnvPort !== null
+      ? 'process-env'
+      : profileEnvPort !== null
+        ? 'profile-env'
+        : (configuredPort !== null ? 'config' : 'default')
+
+    const configuredHost = nonEmptyString(extra?.host) ?? nonEmptyString(apiServer?.host)
+    const profileEnvHost = (envOverridesActive || configuredHost === null)
+      ? nonEmptyString(this.readProfileEnvValue(name, 'API_SERVER_HOST'))
+      : null
+    const processEnvHost = (envOverridesActive || configuredHost === null)
+      ? nonEmptyString(process.env.API_SERVER_HOST)
+      : null
+    const configHost = configuredHost ?? defaultHost
+    const host = processEnvHost ?? profileEnvHost ?? configHost
+    const hostSource: GatewayConfigSource = processEnvHost
+      ? 'process-env'
+      : profileEnvHost
+        ? 'profile-env'
+        : (configuredHost ? 'config' : 'default')
+
+    const configKey = nonEmptyString(extra?.key) ?? nonEmptyString(apiServer?.key) ?? nonEmptyString(apiServer?.api_key)
+    const profileEnvKey = this.readProfileEnvValue(name, 'API_SERVER_KEY')
+    const processEnvKey = nonEmptyString(process.env.API_SERVER_KEY)
+    const apiKey = processEnvKey ?? profileEnvKey ?? configKey ?? null
+    const apiKeySource: GatewayConfigSource | null = processEnvKey
+      ? 'process-env'
+      : profileEnvKey
+        ? 'profile-env'
+        : configKey
+          ? 'config'
+          : null
+
+    return { port, host, apiKey, portSource, hostSource, apiKeySource }
+  }
+
+  /**
+   * 从 profile 的有效运行时配置读取 api_server 端口和主机。
+   * 读取顺序：process env → profile .env → config.yaml → defaults。
+   */
+  private readProfilePort(name: string): { port: number; host: string } {
+    const { port, host } = this.resolveGatewayRuntimeConfig(name)
+    return { port, host }
   }
 
   /** Read a profile gateway PID, falling back to runtime state when gateway.pid is missing. */
@@ -319,11 +440,10 @@ export class GatewayManager {
    *   platforms:
    *     api_server:
    *       enabled: true
-   *       key: ''
-   *       cors_origins: '*'
    *       extra:
    *         port: <port>
    *         host: <host>
+   * 只更新端口/主机，保留用户已有的 key/cors_origins 等安全配置。
    * 同时清理旧的顶层 port/host（避免 Hermes 读取错误）
    */
   private writeProfilePort(name: string, port: number, host: string): void {
@@ -338,8 +458,6 @@ export class GatewayManager {
       if (!cfg.platforms.api_server.extra) cfg.platforms.api_server.extra = {}
 
       cfg.platforms.api_server.enabled = true
-      cfg.platforms.api_server.key = ''
-      cfg.platforms.api_server.cors_origins = '*'
       cfg.platforms.api_server.extra.port = port
       cfg.platforms.api_server.extra.host = host
 
@@ -406,7 +524,10 @@ export class GatewayManager {
       }
     }
 
-    const port = await this.findFreePort(8642, host, usedPorts)
+    const runtimeConfig = this.resolveGatewayRuntimeConfig(name)
+    const port = (runtimeConfig.portSource === 'process-env' || runtimeConfig.portSource === 'profile-env')
+      ? configuredPort
+      : await this.findFreePort(8642, host, usedPorts)
     if (configuredPort !== port) {
       logger.info('Assigning port for profile "%s": %d → %d', name, configuredPort, port)
     } else {
@@ -431,18 +552,10 @@ export class GatewayManager {
     return buildHttpUrl(host, port)
   }
 
-  /** 读取 profile 的 API_SERVER_KEY（从 .env 文件） */
+  /** 读取 profile 的有效 API_SERVER_KEY（process env → .env → config.yaml） */
   getApiKey(profileName?: string): string | null {
     const name = profileName || this.activeProfile
-    try {
-      const envPath = join(this.profileDir(name), '.env')
-      if (!existsSync(envPath)) return null
-      const content = readFileSync(envPath, 'utf-8')
-      const match = content.match(/^API_SERVER_KEY\s*=\s*"?([^"\n]+)"?/m)
-      return match?.[1]?.trim() || null
-    } catch {
-      return null
-    }
+    return this.resolveGatewayRuntimeConfig(name).apiKey
   }
 
   getActiveProfile(): string {

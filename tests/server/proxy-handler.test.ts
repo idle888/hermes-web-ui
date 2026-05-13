@@ -1,16 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
+const { mockUpdateUsage, mockGatewayManager } = vi.hoisted(() => ({
+  mockUpdateUsage: vi.fn(),
+  mockGatewayManager: {
+    getUpstream: vi.fn(() => 'http://127.0.0.1:8642'),
+    getApiKey: vi.fn(() => null as string | null),
+  },
+}))
+
 vi.mock('../../packages/server/src/services/gateway-bootstrap', () => ({
-  getGatewayManagerInstance: () => ({
-    getUpstream: () => 'http://127.0.0.1:8642',
-    getApiKey: () => null,
-  }),
+  getGatewayManagerInstance: () => mockGatewayManager,
 }))
 
 // Mock updateUsage so we can assert calls without real DB
-const { mockUpdateUsage } = vi.hoisted(() => ({
-  mockUpdateUsage: vi.fn(),
-}))
 vi.mock('../../packages/server/src/db/hermes/usage-store', () => ({
   updateUsage: mockUpdateUsage,
 }))
@@ -70,6 +72,8 @@ function createSSEBody(events: string[]): ReadableStream<Uint8Array> {
 describe('Proxy Handler', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockGatewayManager.getUpstream.mockReturnValue('http://127.0.0.1:8642')
+    mockGatewayManager.getApiKey.mockReturnValue(null)
   })
 
   it('rewrites /api/hermes/v1/* to /v1/*', async () => {
@@ -120,6 +124,25 @@ describe('Proxy Handler', () => {
 
     const [, options] = mockFetch.mock.calls[0]
     expect(options.headers.authorization).toBeUndefined()
+  })
+
+
+  it('replaces browser authorization with the effective Hermes API key', async () => {
+    mockGatewayManager.getApiKey.mockReturnValue('gateway-secret')
+    mockFetch.mockResolvedValue({
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      body: null,
+      json: () => Promise.resolve({}),
+    })
+
+    const ctx = createMockCtx({
+      headers: { host: 'localhost:8648', authorization: 'Bearer web-ui-token' },
+    })
+    await proxy(ctx)
+
+    const [, options] = mockFetch.mock.calls[0]
+    expect(options.headers.authorization).toBe('Bearer gateway-secret')
   })
 
   it('replaces host header with upstream host', async () => {

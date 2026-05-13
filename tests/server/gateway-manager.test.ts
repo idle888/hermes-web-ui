@@ -4,6 +4,10 @@ import { join } from 'path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 const originalHermesHome = process.env.HERMES_HOME
+const originalApiServerEnabled = process.env.API_SERVER_ENABLED
+const originalApiServerHost = process.env.API_SERVER_HOST
+const originalApiServerPort = process.env.API_SERVER_PORT
+const originalApiServerKey = process.env.API_SERVER_KEY
 const tempHomes: string[] = []
 
 function createHermesHome(): string {
@@ -27,6 +31,18 @@ afterEach(() => {
   } else {
     process.env.HERMES_HOME = originalHermesHome
   }
+
+  if (originalApiServerEnabled === undefined) delete process.env.API_SERVER_ENABLED
+  else process.env.API_SERVER_ENABLED = originalApiServerEnabled
+
+  if (originalApiServerHost === undefined) delete process.env.API_SERVER_HOST
+  else process.env.API_SERVER_HOST = originalApiServerHost
+
+  if (originalApiServerPort === undefined) delete process.env.API_SERVER_PORT
+  else process.env.API_SERVER_PORT = originalApiServerPort
+
+  if (originalApiServerKey === undefined) delete process.env.API_SERVER_KEY
+  else process.env.API_SERVER_KEY = originalApiServerKey
 
   for (const home of tempHomes.splice(0)) {
     rmSync(home, { recursive: true, force: true })
@@ -93,5 +109,125 @@ describe('GatewayManager Windows process recovery', () => {
     const manager = await createManager(home)
 
     expect(manager.readPidFile('work')).toBe(33333)
+  })
+})
+
+describe('GatewayManager effective API server config', () => {
+  it('uses API_SERVER_PORT and API_SERVER_HOST env overrides when resolving the upstream', async () => {
+    const home = createHermesHome()
+    writeFileSync(join(home, 'config.yaml'), [
+      'platforms:',
+      '  api_server:',
+      '    enabled: true',
+      '    extra:',
+      '      host: 127.0.0.1',
+      '      port: 8642',
+      '',
+    ].join('\n'))
+    process.env.API_SERVER_HOST = '0.0.0.0'
+    process.env.API_SERVER_PORT = '8655'
+
+    const manager = await createManager(home)
+
+    expect(manager.getUpstream()).toBe('http://0.0.0.0:8655')
+    expect(manager.readProfilePort('default')).toEqual({ host: '0.0.0.0', port: 8655 })
+  })
+
+  it('ignores invalid API_SERVER_PORT env values and keeps the configured port', async () => {
+    const home = createHermesHome()
+    writeFileSync(join(home, 'config.yaml'), [
+      'platforms:',
+      '  api_server:',
+      '    enabled: true',
+      '    extra:',
+      '      host: 127.0.0.1',
+      '      port: 8650',
+      '',
+    ].join('\n'))
+    process.env.API_SERVER_PORT = 'not-a-port'
+
+    const manager = await createManager(home)
+
+    expect(manager.getUpstream()).toBe('http://127.0.0.1:8650')
+  })
+
+  it('uses API_SERVER_PORT env as a fallback when config has no port', async () => {
+    const home = createHermesHome()
+    writeFileSync(join(home, 'config.yaml'), [
+      'platforms:',
+      '  api_server:',
+      '    enabled: true',
+      '    extra: {}',
+      '',
+    ].join('\n'))
+    process.env.API_SERVER_PORT = '8655'
+
+    const manager = await createManager(home)
+
+    expect(manager.getUpstream()).toBe('http://127.0.0.1:8655')
+  })
+
+  it('uses API_SERVER_KEY from process env for proxy authentication', async () => {
+    process.env.API_SERVER_KEY = 'env-secret'
+
+    const manager = await createManager(createHermesHome())
+
+    expect(manager.getApiKey()).toBe('env-secret')
+  })
+
+  it('uses API_SERVER_KEY from profile .env when process env is not set', async () => {
+    const home = createHermesHome()
+    writeFileSync(join(home, '.env'), 'API_SERVER_KEY="file-secret"\n')
+
+    const manager = await createManager(home)
+
+    expect(manager.getApiKey()).toBe('file-secret')
+  })
+
+  it('reads API server key from Hermes config when env files are absent', async () => {
+    const home = createHermesHome()
+    writeFileSync(join(home, 'config.yaml'), [
+      'platforms:',
+      '  api_server:',
+      '    enabled: true',
+      '    extra:',
+      '      key: config-secret',
+      '',
+    ].join('\n'))
+
+    const manager = await createManager(home)
+
+    expect(manager.getApiKey()).toBe('config-secret')
+  })
+
+  it('preserves existing API server key and CORS settings when writing the port', async () => {
+    const home = createHermesHome()
+    writeFileSync(join(home, 'config.yaml'), [
+      'platforms:',
+      '  api_server:',
+      '    enabled: true',
+      '    key: legacy-key',
+      '    cors_origins:',
+      '      - https://example.test',
+      '    extra:',
+      '      key: extra-secret',
+      '      cors_origins:',
+      '        - https://api.example.test',
+      '',
+    ].join('\n'))
+
+    const manager = await createManager(home)
+    manager.writeProfilePort('default', 8655, '127.0.0.1')
+
+    const { default: yaml } = await import('js-yaml')
+    const { readFileSync } = await import('fs')
+    const cfg = yaml.load(readFileSync(join(home, 'config.yaml'), 'utf-8')) as any
+
+    expect(cfg.platforms.api_server.key).toBe('legacy-key')
+    expect(cfg.platforms.api_server.cors_origins).toEqual(['https://example.test'])
+    expect(cfg.platforms.api_server.extra.key).toBe('extra-secret')
+    expect(cfg.platforms.api_server.extra.cors_origins).toEqual(['https://api.example.test'])
+    expect(cfg.platforms.api_server.extra.port).toBe(8655)
+    expect(cfg.platforms.api_server.extra.host).toBe('127.0.0.1')
   })
 })
