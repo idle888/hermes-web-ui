@@ -49,6 +49,7 @@ const execFileAsync = promisify(execFile)
 
 const HERMES_BASE = detectHermesHome()
 const HERMES_BIN = getHermesBin()
+const DEFAULT_GATEWAY_STARTUP_TIMEOUT_MS = 60000
 
 /**
  * 检测系统的 init 系统（服务管理器）
@@ -107,6 +108,13 @@ const needsRunMode = true
 // 启动时输出 init 系统检测结果（方便调试）
 logger.debug('Detected init system: %s (needsRunMode: %s, platform: %s)', initSystem, needsRunMode, process.platform)
 
+function envPositiveInt(name: string): number | undefined {
+  const raw = process.env[name]
+  if (!raw) return undefined
+  const value = Number(raw)
+  return Number.isFinite(value) && value > 0 ? value : undefined
+}
+
 // ============================
 // 类型定义
 // ============================
@@ -137,6 +145,27 @@ interface ResolvedGatewayEndpoint {
 function formatHostForUrl(host: string): string {
   if (host.startsWith('[') && host.endsWith(']')) return host
   return host.includes(':') ? `[${host}]` : host
+}
+
+function attachGatewayOutputLogger(profile: string, stream: NodeJS.ReadableStream | null, level: 'info' | 'warn') {
+  if (!stream) return
+  let buffered = ''
+  const writeLine = (line: string) => {
+    const text = line.trim()
+    if (!text) return
+    logger[level]('[gateway:%s] %s', profile, text)
+  }
+
+  stream.on('data', chunk => {
+    buffered += String(chunk)
+    const lines = buffered.split(/\r?\n/)
+    buffered = lines.pop() || ''
+    for (const line of lines) writeLine(line)
+  })
+  stream.on('end', () => {
+    writeLine(buffered)
+    buffered = ''
+  })
 }
 
 function buildHttpUrl(host: string, port: number): string {
@@ -580,12 +609,22 @@ export class GatewayManager {
       const env = { ...process.env, HERMES_HOME: hermesHome }
       const detachGateway = shouldDetachGatewayProcess()
       const child = spawn(HERMES_BIN, ['gateway', 'run', '--replace'], {
-        stdio: 'ignore',
+        stdio: ['ignore', 'pipe', 'pipe'],
         detached: detachGateway,
         windowsHide: true,
         env,
       })
+      attachGatewayOutputLogger(name, child.stdout, 'info')
+      attachGatewayOutputLogger(name, child.stderr, 'warn')
+      child.once('error', err => {
+        logger.error(err, 'Gateway process error for profile "%s" (HERMES_HOME=%s)', name, hermesHome)
+      })
+      child.once('exit', (code, signal) => {
+        logger.warn('Gateway process for profile "%s" exited code=%s signal=%s (HERMES_HOME=%s)', name, code, signal, hermesHome)
+      })
       if (detachGateway) {
+        ;(child.stdout as any)?.unref?.()
+        ;(child.stderr as any)?.unref?.()
         child.unref()
       }
 
@@ -595,18 +634,19 @@ export class GatewayManager {
       // 保存子进程引用，用于后续管理
       this.gateways.set(name, { pid, port, host, url, owned: true, process: child })
 
-      this.waitForReady(name, pid, port, host, url)
+      this.waitForReady(name, pid, port, host, url, hermesHome)
         .then(resolve)
         .catch(reject)
     })
   }
 
-  /** 等待网关健康检查通过，最多 15 秒 */
-  private async waitForReady(name: string, pid: number, port: number, host: string, url: string): Promise<GatewayStatus> {
-    const deadline = Date.now() + 15000
+  /** 等待网关健康检查通过，可通过 HERMES_GATEWAY_STARTUP_TIMEOUT_MS 调整。 */
+  private async waitForReady(name: string, pid: number, port: number, host: string, url: string, hermesHome: string): Promise<GatewayStatus> {
+    const timeoutMs = envPositiveInt('HERMES_GATEWAY_STARTUP_TIMEOUT_MS') ?? DEFAULT_GATEWAY_STARTUP_TIMEOUT_MS
+    const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
       if (pid && !this.isProcessAlive(pid)) {
-        throw new Error(`Gateway process exited unexpectedly (PID: ${pid})`)
+        throw new Error(`Gateway process exited unexpectedly (profile: ${name}, PID: ${pid}, url: ${url}, HERMES_HOME: ${hermesHome})`)
       }
       if (await this.checkHealth(url, 2000)) {
         // "gateway start" 自行管理进程，重新从 pid 文件读取实际 PID
@@ -624,7 +664,7 @@ export class GatewayManager {
       }
       await new Promise(r => setTimeout(r, 500))
     }
-    throw new Error(`Gateway health check timed out after 15000ms`)
+    throw new Error(`Gateway health check timed out after ${timeoutMs}ms (profile: ${name}, PID: ${pid}, url: ${url}, HERMES_HOME: ${hermesHome})`)
   }
 
   private async getListeningPids(port: number): Promise<number[]> {
