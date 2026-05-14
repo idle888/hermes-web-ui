@@ -115,7 +115,7 @@ export const GC_ROOMS_SCHEMA: Record<string, string> = {
   inviteCode: 'TEXT UNIQUE',
   triggerTokens: 'INTEGER NOT NULL DEFAULT 100000',
   maxHistoryTokens: 'INTEGER NOT NULL DEFAULT 32000',
-  tailMessageCount: 'INTEGER NOT NULL DEFAULT 20',
+  tailMessageCount: 'INTEGER NOT NULL DEFAULT 10',
   totalTokens: 'INTEGER NOT NULL DEFAULT 0',
 }
 
