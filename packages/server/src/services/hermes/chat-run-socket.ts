@@ -25,7 +25,7 @@ import { ChatContextCompressor, countTokens, SUMMARY_PREFIX } from '../../lib/co
 import { getCompressionSnapshot } from '../../db/hermes/compression-snapshot'
 import { parseAnthropicContentArray } from '../../lib/llm-json'
 import { updateUsage } from '../../db/hermes/usage-store'
-import { logger } from '../logger'
+import { bridgeLogger, logger } from '../logger'
 import { AgentBridgeClient, type AgentBridgeMessage, type AgentBridgeOutput } from './agent-bridge'
 import { getActiveProfileName } from './hermes-profile'
 import type { ChatMessage } from '../../lib/context-compressor'
@@ -795,6 +795,54 @@ export class ChatRunSocket {
    * then apply context compression (snapshot-aware + LLM) identically for both
    * api_server and CLI bridge runs.
    */
+  private async buildDbHistory(
+    sessionId: string,
+    options: { excludeLastUser?: boolean } = {},
+  ): Promise<ChatMessage[]> {
+    const detail = useLocalSessionStore()
+      ? getSessionDetail(sessionId)
+      : await getSessionDetailFromDb(sessionId)
+    if (!detail?.messages?.length) return []
+
+    const validMessages = detail.messages.filter(m =>
+      (m.role === 'user' || m.role === 'assistant' || m.role === 'tool') && m.content !== undefined,
+    )
+
+    const sourceMessages = options.excludeLastUser
+      ? (() => {
+          const lastUserMsgIndex = [...validMessages].reverse().findIndex(m => m.role === 'user')
+          return lastUserMsgIndex >= 0
+            ? validMessages.slice(0, validMessages.length - lastUserMsgIndex - 1)
+            : validMessages
+        })()
+      : validMessages
+
+    return sourceMessages.map((m, idx, arr) => {
+      const msg: any = { role: m.role, content: m.content || '' }
+      if (m.reasoning_content) msg.reasoning_content = m.reasoning_content
+      if (m.tool_calls?.length) {
+        const cleanedToolCalls = m.tool_calls
+          .filter((tc: any) => tc.id && tc.id.length > 0)
+          .map((tc: any) => ({ id: tc.id, type: tc.type, function: tc.function }))
+        if (cleanedToolCalls.length > 0) msg.tool_calls = cleanedToolCalls
+      }
+      if (m.role === 'tool') {
+        let callId = m.tool_call_id
+        if (!callId || callId.length === 0) {
+          const prevMsg = arr[idx - 1]
+          if (prevMsg?.role === 'assistant' && prevMsg.tool_calls?.length) {
+            const tc = prevMsg.tool_calls.find((t: any) => t.function?.name === m.tool_name)
+            if (tc?.id) callId = tc.id
+          }
+        }
+        if (!callId || callId.length === 0) return null
+        msg.tool_call_id = callId
+      }
+      if (m.tool_name) msg.name = m.tool_name
+      return msg
+    }).filter((m): m is ChatMessage => m !== null)
+  }
+
   private async buildCompressedHistory(
     sessionId: string,
     profile: string,
@@ -803,44 +851,7 @@ export class ChatRunSocket {
     emit: (event: string, payload: any) => void,
   ): Promise<ChatMessage[]> {
     try {
-      const detail = useLocalSessionStore()
-        ? getSessionDetail(sessionId)
-        : await getSessionDetailFromDb(sessionId)
-      if (!detail?.messages?.length) return []
-
-      const validMessages = detail.messages.filter(m =>
-        (m.role === 'user' || m.role === 'assistant' || m.role === 'tool') && m.content !== undefined,
-      )
-
-      // Exclude the last user message (just added by the caller)
-      const lastUserMsgIndex = [...validMessages].reverse().findIndex(m => m.role === 'user')
-      let history: ChatMessage[] = (lastUserMsgIndex >= 0
-        ? validMessages.slice(0, validMessages.length - lastUserMsgIndex - 1)
-        : validMessages
-      ).map((m, idx, arr) => {
-        const msg: any = { role: m.role, content: m.content || '' }
-        if (m.reasoning_content) msg.reasoning_content = m.reasoning_content
-        if (m.tool_calls?.length) {
-          const cleanedToolCalls = m.tool_calls
-            .filter((tc: any) => tc.id && tc.id.length > 0)
-            .map((tc: any) => ({ id: tc.id, type: tc.type, function: tc.function }))
-          if (cleanedToolCalls.length > 0) msg.tool_calls = cleanedToolCalls
-        }
-        if (m.role === 'tool') {
-          let callId = m.tool_call_id
-          if (!callId || callId.length === 0) {
-            const prevMsg = arr[idx - 1]
-            if (prevMsg?.role === 'assistant' && prevMsg.tool_calls?.length) {
-              const tc = prevMsg.tool_calls.find((t: any) => t.function?.name === m.tool_name)
-              if (tc?.id) callId = tc.id
-            }
-          }
-          if (!callId || callId.length === 0) return null
-          msg.tool_call_id = callId
-        }
-        if (m.tool_name) msg.name = m.tool_name
-        return msg
-      }).filter((m): m is ChatMessage => m !== null)
+      let history = await this.buildDbHistory(sessionId, { excludeLastUser: true })
 
       if (history.length === 0) return []
 
@@ -954,23 +965,9 @@ export class ChatRunSocket {
   private async forceCompressBridgeHistory(
     sessionId: string,
     profile: string,
-    messages: ChatMessage[],
+    _messages: ChatMessage[],
   ): Promise<ChatMessage[]> {
-    const history = messages
-      .filter(m => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'tool' || m.role === 'system'))
-      .map(m => {
-        const msg: any = { role: m.role, content: m.content || '' }
-        if (m.reasoning_content) msg.reasoning_content = m.reasoning_content
-        if (m.tool_calls?.length) {
-          const cleanedToolCalls = m.tool_calls
-            .filter((tc: any) => tc.id && tc.id.length > 0)
-            .map((tc: any) => ({ id: tc.id, type: tc.type, function: tc.function }))
-          if (cleanedToolCalls.length > 0) msg.tool_calls = cleanedToolCalls
-        }
-        if (m.tool_call_id) msg.tool_call_id = m.tool_call_id
-        if (m.name) msg.name = m.name
-        return msg as ChatMessage
-      })
+    const history = await this.buildDbHistory(sessionId, { excludeLastUser: false })
 
     if (history.length === 0) return []
 
@@ -979,10 +976,36 @@ export class ChatRunSocket {
     const totalTokens = countTokens(JSON.stringify(history))
     logger.info('[context-compress] bridge forced compression session=%s: %d messages, ~%d tokens',
       sessionId, history.length, totalTokens)
+    bridgeLogger.info({
+      sessionId,
+      profile,
+      historyMessages: history.length,
+      bridgeProvidedMessages: Array.isArray(_messages) ? _messages.length : 0,
+      tokenEstimate: totalTokens,
+      snapshotAware: true,
+    }, '[chat-run-socket] bridge forced compression started')
 
-    const result = await compressor.compress(history, upstream, apiKey, undefined, profile)
+    const result = await compressor.compress(history, upstream, apiKey, sessionId, profile)
     logger.info('[context-compress] bridge forced compression done session=%s: %d -> %d messages',
       sessionId, history.length, result.messages.length)
+    bridgeLogger.info({
+      sessionId,
+      profile,
+      beforeMessages: history.length,
+      resultMessages: result.messages.length,
+      compressed: result.meta.compressed,
+      llmCompressed: result.meta.llmCompressed,
+      verbatimCount: result.meta.verbatimCount,
+      compressedStartIndex: result.meta.compressedStartIndex,
+      compressedHistory: result.messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+        reasoning_content: m.reasoning_content,
+        tool_calls: m.tool_calls,
+        tool_call_id: m.tool_call_id,
+        name: m.name,
+      })),
+    }, '[chat-run-socket] bridge forced compression completed')
 
     return result.messages.map(m => {
       const msg: any = { role: m.role, content: m.content }
@@ -1079,8 +1102,22 @@ export class ChatRunSocket {
 
     try {
       logger.info('[chat-run-socket] starting CLI bridge run for session %s', session_id)
-      const started = await this.bridge.chat(session_id, input as AgentBridgeMessage, history, instructions, profile)
+      bridgeLogger.info({
+        sessionId: session_id,
+        profile,
+        inputChars: inputStr.length,
+        historyMessages: history.length,
+        hasInstructions: Boolean(instructions),
+      }, '[chat-run-socket] starting CLI bridge run')
+      const started = await this.bridge.chat(session_id, input as AgentBridgeMessage, history, instructions, profile, {
+        force_compress: true,
+      })
       state.runId = started.run_id
+      bridgeLogger.info({
+        sessionId: session_id,
+        runId: started.run_id,
+        status: started.status,
+      }, '[chat-run-socket] CLI bridge run started')
       this.pushState(session_id, 'run.started', {
         event: 'run.started',
         run_id: started.run_id,
