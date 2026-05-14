@@ -9,7 +9,7 @@ import {
 } from '../../db/hermes/session-store'
 import { ExportCompressor } from '../../lib/context-compressor/export-compressor'
 import { getGatewayManagerInstance } from '../../services/gateway-bootstrap'
-import { deleteUsage, getUsage, getUsageBatch, getLocalUsageStats } from '../../db/hermes/usage-store'
+import { deleteUsage, getUsage, getUsageBatch } from '../../db/hermes/usage-store'
 import type { UsageStatsModelRow, UsageStatsDailyRow } from '../../db/hermes/usage-store'
 import { getModelContextLength } from '../../services/hermes/model-context'
 import { getActiveProfileName } from '../../services/hermes/hermes-profile'
@@ -276,11 +276,6 @@ export async function usageStats(ctx: any) {
   const rawDays = parseInt(String(ctx.query?.days ?? '30'), 10)
   const days = Number.isFinite(rawDays) && rawDays > 0 ? Math.min(rawDays, 365) : 30
 
-  // Local Web UI chat usage is kept in the dashboard DB and must be merged
-  // with Hermes' native state.db analytics for the same period.
-  const currentProfile = getActiveProfileName()
-  const local = getLocalUsageStats(currentProfile, days)
-
   let hermes = {
     input_tokens: 0,
     output_tokens: 0,
@@ -300,29 +295,6 @@ export async function usageStats(ctx: any) {
     logger.warn(err, 'usageStats: failed to load Hermes usage analytics from state.db')
   }
 
-  const totalInput = local.input_tokens + hermes.input_tokens
-  const totalOutput = local.output_tokens + hermes.output_tokens
-  const totalCacheRead = local.cache_read_tokens + hermes.cache_read_tokens
-  const totalCacheWrite = local.cache_write_tokens + hermes.cache_write_tokens
-  const totalReasoning = local.reasoning_tokens + hermes.reasoning_tokens
-  const totalSessions = local.sessions + hermes.sessions
-
-  const modelMap = new Map<string, UsageStatsModelRow>()
-  for (const m of [...local.by_model, ...hermes.by_model]) {
-    const model = (m.model || '').trim() || 'unknown'
-    const existing = modelMap.get(model)
-    if (existing) {
-      existing.input_tokens += m.input_tokens
-      existing.output_tokens += m.output_tokens
-      existing.cache_read_tokens += m.cache_read_tokens
-      existing.cache_write_tokens += m.cache_write_tokens
-      existing.reasoning_tokens += m.reasoning_tokens
-      existing.sessions += m.sessions
-    } else {
-      modelMap.set(model, { ...m, model })
-    }
-  }
-
   const dayMap = new Map<string, UsageStatsDailyRow>()
   const now = new Date()
   for (let i = days - 1; i >= 0; i--) {
@@ -331,7 +303,7 @@ export async function usageStats(ctx: any) {
     const key = d.toISOString().slice(0, 10)
     dayMap.set(key, { date: key, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, sessions: 0, errors: 0, cost: 0 })
   }
-  for (const d of [...local.by_day, ...hermes.by_day]) {
+  for (const d of hermes.by_day) {
     const existing = dayMap.get(d.date)
     if (existing) {
       existing.input_tokens += d.input_tokens; existing.output_tokens += d.output_tokens
@@ -341,16 +313,16 @@ export async function usageStats(ctx: any) {
   }
 
   ctx.body = {
-    total_input_tokens: totalInput,
-    total_output_tokens: totalOutput,
-    total_cache_read_tokens: totalCacheRead,
-    total_cache_write_tokens: totalCacheWrite,
-    total_reasoning_tokens: totalReasoning,
-    total_sessions: totalSessions,
+    total_input_tokens: hermes.input_tokens,
+    total_output_tokens: hermes.output_tokens,
+    total_cache_read_tokens: hermes.cache_read_tokens,
+    total_cache_write_tokens: hermes.cache_write_tokens,
+    total_reasoning_tokens: hermes.reasoning_tokens,
+    total_sessions: hermes.sessions,
     total_cost: hermes.cost,
     total_api_calls: hermes.total_api_calls,
     period_days: days,
-    model_usage: [...modelMap.values()].sort((a, b) => (b.input_tokens + b.output_tokens) - (a.input_tokens + a.output_tokens)),
+    model_usage: hermes.by_model.sort((a, b) => (b.input_tokens + b.output_tokens) - (a.input_tokens + a.output_tokens)),
     daily_usage: [...dayMap.values()],
   }
 }

@@ -355,6 +355,7 @@ class AgentPool:
         self._lock = threading.RLock()
         self._db = SessionDbHolder()
         self._approval_requests: dict[str, queue.Queue[str]] = {}
+        self._compression_requests: dict[str, queue.Queue[dict[str, Any]]] = {}
 
     def get_or_create(
         self,
@@ -412,6 +413,8 @@ class AgentPool:
                     tool_start_callback=self._tool_start_callback(session_id),
                     tool_complete_callback=self._tool_complete_callback(session_id),
                 )
+                agent.compression_enabled = False
+                self._install_compression_hook(agent, session_id)
 
                 session = AgentSession(
                     session_id=session_id,
@@ -434,6 +437,84 @@ class AgentPool:
                 return session
             finally:
                 _restore_profile_env(original_home)
+
+    def _install_compression_hook(self, agent: Any, session_id: str) -> None:
+        original = getattr(agent, "_compress_context", None)
+        if not callable(original):
+            return
+
+        def wrapped_compress_context(messages, system_message, **kwargs):
+            before_count = len(messages) if isinstance(messages, list) else 0
+            request_id = uuid.uuid4().hex
+            response_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+            with self._lock:
+                self._compression_requests[request_id] = response_queue
+            self._append_event(session_id, {
+                "event": "bridge.compression.requested",
+                "request_id": request_id,
+                "message_count": before_count,
+                "approx_tokens": kwargs.get("approx_tokens"),
+                "focus_topic": kwargs.get("focus_topic"),
+                "messages": _jsonable(messages),
+            })
+            try:
+                response = response_queue.get(timeout=180)
+                if response.get("error"):
+                    raise RuntimeError(str(response.get("error")))
+                compressed_messages = response.get("messages")
+                if not isinstance(compressed_messages, list):
+                    raise RuntimeError("bridge compression response missing messages")
+                next_system_message = response.get("system_message", system_message)
+                self._append_event(session_id, {
+                    "event": "bridge.compression.completed",
+                    "request_id": request_id,
+                    "message_count": before_count,
+                    "result_messages": len(compressed_messages),
+                    "approx_tokens": kwargs.get("approx_tokens"),
+                    "compressed": True,
+                })
+                return compressed_messages, next_system_message
+            except queue.Empty:
+                self._append_event(session_id, {
+                    "event": "bridge.compression.failed",
+                    "request_id": request_id,
+                    "message_count": before_count,
+                    "approx_tokens": kwargs.get("approx_tokens"),
+                    "error": "bridge compression timed out",
+                })
+                raise RuntimeError("bridge compression timed out")
+            except Exception as exc:
+                self._append_event(session_id, {
+                    "event": "bridge.compression.failed",
+                    "request_id": request_id,
+                    "message_count": before_count,
+                    "approx_tokens": kwargs.get("approx_tokens"),
+                    "error": str(exc),
+                })
+                raise
+            finally:
+                with self._lock:
+                    self._compression_requests.pop(request_id, None)
+
+        agent._compress_context = wrapped_compress_context
+
+    def respond_compression(
+        self,
+        request_id: str,
+        messages: list[dict[str, Any]] | None = None,
+        system_message: str | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            response_queue = self._compression_requests.get(request_id)
+        if response_queue is None:
+            raise RuntimeError(f"compression request {request_id} not found")
+        response_queue.put({
+            "messages": messages,
+            "system_message": system_message,
+            "error": error,
+        })
+        return {"request_id": request_id, "handled": True}
 
     def _destroy_session(self, session_id: str) -> None:
         session = self._sessions.pop(session_id, None)
@@ -949,6 +1030,20 @@ class BridgeServer:
             if not approval_id:
                 raise ValueError("approval_id is required")
             return self.pool.respond_approval(approval_id, str(req.get("choice") or "deny"))
+
+        if action == "compression_respond":
+            request_id = str(req.get("request_id") or "").strip()
+            if not request_id:
+                raise ValueError("request_id is required")
+            messages = req.get("messages")
+            if messages is not None and not isinstance(messages, list):
+                raise ValueError("messages must be a list")
+            return self.pool.respond_compression(
+                request_id,
+                messages=messages,
+                system_message=req.get("system_message"),
+                error=req.get("error"),
+            )
 
         if action == "get_history":
             return self.pool.get_history(str(req.get("session_id") or ""))

@@ -295,6 +295,17 @@ export class AgentBridgeClient {
     return this.request({ action: 'approval_respond', approval_id: approvalId, choice })
   }
 
+  compressionRespond(
+    requestId: string,
+    payload: { messages?: unknown[]; system_message?: string; error?: string },
+  ): Promise<AgentBridgeResponse> {
+    return this.request({
+      action: 'compression_respond',
+      request_id: requestId,
+      ...payload,
+    }, { timeoutMs: this.timeoutMs })
+  }
+
   destroyAll(): Promise<AgentBridgeResponse> {
     return this.request({ action: 'destroy_all' })
   }

@@ -535,8 +535,21 @@ export class ChatRunSocket {
   ) {
     const { input, session_id, model, instructions } = data
     const source = this.resolveRunSource(data.source, session_id)
+
+    // Build full instructions with system prompt + workspace context (shared by both paths)
+    let fullInstructions = instructions
+      ? `${getSystemPrompt()}\n${instructions}`
+      : getSystemPrompt()
+    if (session_id) {
+      const sessionRow = getSession(session_id)
+      if (sessionRow?.workspace) {
+        const workspaceCtx = `[Current working directory: ${sessionRow.workspace}]`
+        fullInstructions = `\n${workspaceCtx}\n${fullInstructions}`
+      }
+    }
+
     if (source === 'cli') {
-      await this.handleBridgeRun(socket, data, profile, skipUserMessage)
+      await this.handleBridgeRun(socket, { ...data, instructions: fullInstructions }, profile, skipUserMessage)
       return
     }
 
@@ -629,21 +642,7 @@ export class ChatRunSocket {
       // Build upstream request body
       const body: Record<string, any> = { input }
       if (model) body.model = model
-      if (instructions) {
-        body.instructions = `${getSystemPrompt()}\n${instructions}`
-      } else {
-        body.instructions = getSystemPrompt()
-      }
-      // Inject workspace context if set for this session
-      if (session_id) {
-        const sessionRow = getSession(session_id)
-        if (sessionRow?.workspace) {
-          const workspaceCtx = `[Current working directory: ${sessionRow.workspace}]`
-          body.instructions = body.instructions
-            ? `\n${workspaceCtx}\n${body.instructions}`
-            : `\n${workspaceCtx}`
-        }
-      }
+      body.instructions = fullInstructions
       // Build conversation_history from DB if session_id is provided
       if (session_id) {
         const compressed = await this.buildCompressedHistory(session_id, profile, upstream, apiKey, emit)
@@ -952,6 +951,54 @@ export class ChatRunSocket {
     }
   }
 
+  private async forceCompressBridgeHistory(
+    sessionId: string,
+    profile: string,
+    messages: ChatMessage[],
+  ): Promise<ChatMessage[]> {
+    const history = messages
+      .filter(m => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'tool' || m.role === 'system'))
+      .map(m => {
+        const msg: any = { role: m.role, content: m.content || '' }
+        if (m.reasoning_content) msg.reasoning_content = m.reasoning_content
+        if (m.tool_calls?.length) {
+          const cleanedToolCalls = m.tool_calls
+            .filter((tc: any) => tc.id && tc.id.length > 0)
+            .map((tc: any) => ({ id: tc.id, type: tc.type, function: tc.function }))
+          if (cleanedToolCalls.length > 0) msg.tool_calls = cleanedToolCalls
+        }
+        if (m.tool_call_id) msg.tool_call_id = m.tool_call_id
+        if (m.name) msg.name = m.name
+        return msg as ChatMessage
+      })
+
+    if (history.length === 0) return []
+
+    const upstream = this.gatewayManager.getUpstream(profile).replace(/\/$/, '')
+    const apiKey = this.gatewayManager.getApiKey(profile) || undefined
+    const totalTokens = countTokens(JSON.stringify(history))
+    logger.info('[context-compress] bridge forced compression session=%s: %d messages, ~%d tokens',
+      sessionId, history.length, totalTokens)
+
+    const result = await compressor.compress(history, upstream, apiKey, undefined, profile)
+    logger.info('[context-compress] bridge forced compression done session=%s: %d -> %d messages',
+      sessionId, history.length, result.messages.length)
+
+    return result.messages.map(m => {
+      const msg: any = { role: m.role, content: m.content }
+      if (m.reasoning_content) msg.reasoning_content = m.reasoning_content
+      if (m.tool_calls?.length) {
+        const cleanedToolCalls = m.tool_calls
+          .filter((tc: any) => tc.id && tc.id.length > 0)
+          .map((tc: any) => ({ id: tc.id, type: tc.type, function: tc.function }))
+        if (cleanedToolCalls.length > 0) msg.tool_calls = cleanedToolCalls
+      }
+      if (m.tool_call_id) msg.tool_call_id = m.tool_call_id
+      if (m.name) msg.name = m.name
+      return msg
+    })
+  }
+
   private resolveRunSource(source?: string, sessionId?: string): ChatRunSource {
     const normalized = String(source || '').trim()
     if (normalized === 'cli') return 'cli'
@@ -1046,9 +1093,16 @@ export class ChatRunSocket {
       })
 
       for await (const chunk of this.bridge.streamOutput(started.run_id)) {
-        this.applyBridgeChunk(socket, state, session_id, runMarker, chunk, emit)
+        await this.applyBridgeChunk(socket, state, session_id, runMarker, chunk, emit, profile)
         if (chunk.done) break
       }
+      // Update usage after normal completion (applyBridgeChunk already did cleanup)
+      const usage = await this.calcAndUpdateUsage(session_id, state, emit)
+      updateUsage(session_id, {
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        profile: state.profile,
+      })
     } catch (err: any) {
       if (!state.isWorking) return
       const queueLen = state.queue?.length ?? 0
@@ -1061,6 +1115,12 @@ export class ChatRunSocket {
       updateSessionStats(session_id)
       const message = err instanceof Error ? err.message : String(err)
       emit('run.failed', { event: 'run.failed', error: message, queue_remaining: queueLen })
+      const errUsage = await this.calcAndUpdateUsage(session_id, state, emit)
+      updateUsage(session_id, {
+        inputTokens: errUsage.inputTokens,
+        outputTokens: errUsage.outputTokens,
+        profile: state.profile,
+      })
       if (queueLen > 0) this.dequeueNextQueuedRun(socket, session_id)
     }
   }
@@ -1072,7 +1132,20 @@ export class ChatRunSocket {
     runMarker: string,
     chunk: AgentBridgeOutput,
     emit: (event: string, payload: any) => void,
-  ) {
+    profile: string,
+  ): Promise<void> {
+    return this.applyBridgeChunkAsync(socket, state, sessionId, runMarker, chunk, emit, profile)
+  }
+
+  private async applyBridgeChunkAsync(
+    socket: Socket,
+    state: SessionState,
+    sessionId: string,
+    runMarker: string,
+    chunk: AgentBridgeOutput,
+    emit: (event: string, payload: any) => void,
+    profile: string,
+  ): Promise<void> {
     state.runId = chunk.run_id
 
     for (const ev of chunk.events || []) {
@@ -1089,7 +1162,7 @@ export class ChatRunSocket {
           tool: toolName,
           name: toolName,
           arguments: tool.arguments,
-          preview: ev.preview || '',
+          preview: ev.preview || summarizeToolArguments(tool.arguments),
         }
         this.pushState(sessionId, 'tool.started', payload)
         emit('tool.started', payload)
@@ -1103,7 +1176,7 @@ export class ChatRunSocket {
           tool: toolName,
           name: toolName,
           output: completed.output,
-          duration: ev.duration,
+          duration: completed.duration ?? ev.duration,
           error: ev.is_error || undefined,
         }
         this.pushState(sessionId, 'tool.completed', payload)
@@ -1150,6 +1223,58 @@ export class ChatRunSocket {
         }
         this.replaceState(sessionId, 'approval.resolved', payload)
         emit('approval.resolved', payload)
+      } else if (evType === 'bridge.compression.requested') {
+        const payload = {
+          event: 'compression.started',
+          run_id: chunk.run_id,
+          request_id: ev.request_id,
+          message_count: ev.message_count,
+          token_count: ev.approx_tokens,
+          source: 'bridge',
+        }
+        this.replaceState(sessionId, 'compression.started', payload)
+        emit('compression.started', payload)
+        if (ev.request_id && Array.isArray(ev.messages)) {
+          try {
+            const compressed = await this.forceCompressBridgeHistory(
+              sessionId,
+              profile,
+              ev.messages as ChatMessage[],
+            )
+            await this.bridge.compressionRespond(String(ev.request_id), { messages: compressed })
+          } catch (err: any) {
+            await this.bridge.compressionRespond(String(ev.request_id), {
+              error: err?.message || String(err),
+            }).catch(() => undefined)
+          }
+        }
+      } else if (evType === 'bridge.compression.completed') {
+        const payload = {
+          event: 'compression.completed',
+          run_id: chunk.run_id,
+          request_id: ev.request_id,
+          compressed: ev.compressed !== false,
+          totalMessages: ev.message_count,
+          resultMessages: ev.result_messages,
+          beforeTokens: ev.approx_tokens,
+          source: 'bridge',
+        }
+        this.replaceState(sessionId, 'compression.completed', payload)
+        emit('compression.completed', payload)
+      } else if (evType === 'bridge.compression.failed') {
+        const payload = {
+          event: 'compression.completed',
+          run_id: chunk.run_id,
+          request_id: ev.request_id,
+          compressed: false,
+          totalMessages: ev.message_count,
+          resultMessages: ev.message_count,
+          beforeTokens: ev.approx_tokens,
+          error: ev.error,
+          source: 'bridge',
+        }
+        this.replaceState(sessionId, 'compression.completed', payload)
+        emit('compression.completed', payload)
       } else if (evType === 'status') {
         emit('agent.event', {
           event: 'agent.event',
@@ -1337,7 +1462,7 @@ export class ChatRunSocket {
     runMarker: string,
     toolName: string,
     ev: Record<string, unknown>,
-  ): { id: string; output: string } {
+  ): { id: string; output: string; duration?: number } {
     state.bridgePendingTools = state.bridgePendingTools || []
     const rawId = ev.tool_call_id
     let idx = rawId
@@ -1386,7 +1511,11 @@ export class ChatRunSocket {
       timestamp,
     })
 
-    return { id, output }
+    const duration = pending?.startedAt
+      ? Math.round((Date.now() - pending.startedAt) / 10) / 100
+      : undefined
+
+    return { id, output, duration }
   }
 
   private bridgeToolCallId(state: SessionState, rawToolCallId: unknown, toolName: string): string {
@@ -1714,6 +1843,10 @@ export class ChatRunSocket {
 
     const profile = state.profile
     updateSessionStats(sessionId)
+    const emit = (event: string, payload: any) => {
+      this.nsp.to(`session:${sessionId}`).emit(event, { ...payload, session_id: sessionId })
+    }
+    await this.calcAndUpdateUsage(sessionId, state, emit)
 
     state.isWorking = false
     state.isAborting = false
